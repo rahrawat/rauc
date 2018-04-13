@@ -25,14 +25,8 @@ addons:
     sources: &sources
       - ubuntu-toolchain-r-test
       - sourceline: 'deb http://archive.ubuntu.com/ubuntu/ trusty main restricted universe multiverse'
-  coverity_scan:
-    project:
-      name: "jluebbe/rauc"
-      description: "Robust Auto-Update Controller"
-    notification_email: jluebbe@lasnet.de
-    build_command_prepend: "cov-configure --comptype gcc --compiler gcc-7 --template && ./autogen.sh && ./configure"
-    build_command: "make -j2"
-    branch_pattern: master
+before_script:
+  - ./build-uncrustify.sh
 script:
   - ./autogen.sh
   - ./configure --enable-code-coverage
@@ -43,5 +37,8 @@ script:
   - make distcheck
 after_success:
   - coveralls --build-root '.' --exclude test --exclude rauc-installer-generated.c
+  - ./uncrustify.sh && git diff --exit-code
 after_failure:
   - cat test/*.log
+  - cat test-suite.log
+  - ./uncrustify.sh && git diff --exit-code

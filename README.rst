@@ -21,6 +21,9 @@ RAUC - Robust Auto-Update Controller
 .. image:: https://readthedocs.org/projects/rauc/badge/?version=latest
    :alt: Documentation
    :target: http://rauc.readthedocs.org/en/latest/?badge=latest
+.. image:: https://matrix.to/img/matrix-badge.svg
+   :alt: Chat
+   :target: https://riot.im/app/#/room/#rauc:matrix.org
 
 RAUC controls the update process on embedded linux systems. It is both a target
 application that runs as an update client and a host/target tool
@@ -29,6 +32,9 @@ that allows you to create, inspect and modify installation artifacts.
 Source Code: https://github.com/rauc/rauc
 
 Documentation: https://rauc.readthedocs.org/
+
+Chat: IRC channel ``#rauc`` on freenode (bridged to the
+`Matrix channel #rauc:matrix.org <https://riot.im/app/#/room/#rauc:matrix.org>`_)
 
 Features
 --------
@@ -59,6 +65,7 @@ Features
 * Storage support:
 
   * ext2/3/4 filesystem
+  * eMMC boot partitions (atomic update)
   * vfat filesystem
   * UBI volumes
   * UBIFS
@@ -133,7 +140,7 @@ Host (Build) Prerequisites
 -  libssl-dev
 
    sudo apt-get install automake libtool libglib2.0-dev libcurl3-dev
-   libssl-dev
+   libssl-dev libjson-glib-dev
 
 If you intend to use json-support you also need
 

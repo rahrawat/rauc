@@ -41,7 +41,7 @@ parameters for certificates and additional parameters to be stored during
 signing.
 Configuring a CA correctly (and securely) is a complex topic and obviously
 exceeds the scope of this documentation.
-As a starting point, the OpenSSL manual pages (espcially ca_, req_, x509_, cms_,
+As a starting point, the OpenSSL manual pages (especially ca_, req_, x509_, cms_,
 verify_ and config_) and Stefan H. Holek's pki-tutorial_ are useful.
 
 .. _ca: https://www.openssl.org/docs/manmaster/man1/ca.html
@@ -134,7 +134,7 @@ the release case.
 
 Doing this would be possible in a slot's post-install hook, for example.
 Depending on whether the bundle to install was signed with a development or a
-relase certificate, either the production or development keyring will be copied
+release certificate, either the production or development keyring will be copied
 to the location where RAUC expects it to be.
 
 To allow comparing hashes, RAUC generates SPKI hashes (i.e. hashes over the
@@ -208,7 +208,7 @@ over or can access the data of the old system.
 Storing Data in The Root File System
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-In case of a writeable root file system, it often contains additional data,
+In case of a writable root file system, it often contains additional data,
 for example cryptographic material specific to the machine, or configuration
 files modified by the user.
 When performing the update, you have to ensure that the files you need to
@@ -221,8 +221,8 @@ For migrating data from your old rootfs to your updated rootfs,
 simply specify a slot post-install hook.
 Read the :ref:`Hooks <sec-hooks>` chapter on how to create one.
 
-Using Data Partions
-~~~~~~~~~~~~~~~~~~~
+Using Data Partitions
+~~~~~~~~~~~~~~~~~~~~~
 
 Often, there are a couple of reasons why you don't want to or cannot store
 your data inside the root file system:
@@ -286,6 +286,119 @@ are listed below:
 | Fallback  | tricky (reconvert data?) | easy (old data!)          |
 +-----------+--------------------------+---------------------------+
 
+.. _casync-support:
+
+RAUC casync Support
+-------------------
+
+.. warning:: casync support is still experimental and lacks some unit tests.
+
+  When evaluating, make sure to compile a recent casync version from the
+  `git <https://github.com/systemd/casync>`_ for testing.
+
+Using the Content-Addressable Data Synchronization tool `casync` for updating
+embedded / IoT devices provides a couple of benefits.
+By splitting and chunking the update artifacts into reusable pieces, casync
+allows to
+
+ * stream remote bundles to the target without occupying storage / NAND
+ * minimize transferred data for an update by downloading only the delta to the
+   running system
+ * reduce data storage on server side by eliminating redundancy
+ * good handling for CDNs due to similar chunk sizes
+
+For a full description of the way casync works and what you can do with it,
+refer to the
+`blog post <http://0pointer.net/blog/casync-a-tool-for-distributing-file-system-images.html>`_
+by its author Lennart Poettering or visit the
+`GitHub site <https://github.com/systemd/casync>`_.
+
+RAUC supports using casync index files instead of complete images in its bundles.
+This way the real size of the bundle comes down to the size of the index files
+required for referring to the individual chunks.
+The real image data contained in the individual chunks can be stored in one
+single repository, for a whole systems with multiple images as well as for
+multiple systems in different versions, etc.
+This makes the approach quite flexible.
+
+Creating casync Bundles
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Creating RAUC bundles with casync index files is a bit different from creating
+'conventional' bundles.
+While the bundle format remains the same and you could also mix conventional
+and casync-based bundles, creating these bundles is not straight forward when
+using common embedded build systems such as Yocto, PTXdist or buildroot.
+
+Because of this, we decided use a two-step process for creating casync RAUC
+bundles:
+
+ 1. Create 'conventional' RAUC bundle
+ 2. Convert to casync-based RAUC bundle
+
+RAUC provides a command for creating casync-based bundles from  'conventional'
+bundles.
+Simply call::
+
+  rauc convert --cert=<certfile> --key=<keyfile> --keyring=<keyring> conventional-bundle.raucb casync-bundle.raucb
+
+The conversion process will create two new artifacts:
+
+ 1. The converted bundle `casync-bundle.raucb` with casnyc index files instead
+    of image files
+ 2. A casync chunk store `casync-bundle.castr/` for all bundle images.
+    This is a directory with chunks grouped by subfolders of the first 4 digits
+    of their chunk ID.
+
+Installing casync Bundles
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The main difference between installing conventional bundles and bundles that
+contain casync index files is that RAUC requires access to the remote casync
+chunk store during installation of the bundle.
+
+Due to the built-in network support of both casync and RAUC, it is possible to
+directly give a network URL as the source of the bundle::
+
+  rauc install https://server.example.com/deploy/bundle-20180112.raucb
+
+By default, RAUC will assume the corresponding casync chunk store is located at
+the same location as the bundle (with the ``.castr`` extension instead of
+``.raucb``), in this example at
+``https://server.example.com/deploy/bundle-20180112.castr``.
+The default location can also be configured in the system config to point to a
+generic location that is valid for all installations.
+
+When installing a bundle, the casync implementation will automatically handle
+the chunk download via an unprivileged helper binary.
+
+Reducing Download Size -- Seeding
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Reducing the amount of data to be transferred over slow connections is one of
+the main goals of using casync for updating.
+Casync splits up the images or directory trees it handles into reusable chunks
+of similar size.
+Doing this both on the source as well as on the destination side allows
+comparing the hashes of the resulting chunks to know which parts are different.
+
+When we update a system, we usually do not change its entire file tree, but
+only update a few libraries, the kernel, the application, etc.
+Thus, most of the data can be retrieved from the currently active system and
+does not need to be fetched via the network.
+
+For each casync image that RAUC extracts to the target slot, it determines an
+appropriate seed.
+This is normally a redundant slot of the same class as the target slot but from
+the currently booted slot group.
+
+.. note::
+  Depending on your targets processing and storage speed, updating slots with
+  casync can be a bit slower than conventional updates,
+  because casync first has to process the entire seed slot to calculate the
+  seed chunks.
+  After this is done it will start writing the data and fetch missing chunks
+  via the network.
 
 .. _sec-variants:
 
@@ -364,9 +477,24 @@ On all other systems, the default image will be used instead.
 If you have a specific image variant for one of your systems,
 it is mandatory to also have a default or specific variant for the same slot
 class for any other system you intend to update.
-RAUC will report an error if for example a booloader image is only present for
+RAUC will report an error if for example a bootloader image is only present for
 variant A when you try to install on variant B.
 This should prevent from bricking your device by unintentional partial updates.
+
+.. _sec-manual-write:
+
+Manually Writing Images to Slots
+--------------------------------
+
+In order to write an image to a slot without using update mechanics like hooks,
+slot status etc. use:
+
+.. code-block:: sh
+
+  rauc write-slot <slotname> <image>
+
+This uses the correct handler to write the image to the slot. It is useful for
+development scenarios as well as initial provisioning of embedded boards.
 
 Updating the Bootloader
 -----------------------
@@ -391,14 +519,39 @@ non-bootable system caused by an error or power-loss during the update.
 
 Whether atomic bootloader updates can be implemented depends on your
 SoC/firmware and storage medium.
-For example eMMCs have two dedicated boot partitions (see the JEDEC standard
-JESD84-B51_ for details), one of which can be enabled atomically via
-configuration registers in the eMMC.
+
+Update eMMC Boot Partitions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+RAUC supports updating eMMC boot partitions (see the JEDEC standard JESD84-B51_
+for details), one of which gets enabled atomically via configuration registers
+in the eMMC (*ext_csd registers*).
 
 .. _JESD84-B51: http://www.jedec.org/standards-documents/results/jesd84-b51
 
-As a further example, the NXP i.MX6 supports up to four bootloader copies when
-booting from NAND flash.
+The required slot type is ``boot-emmc``.
+The device to be specified is expected to be the root device.
+The boot partitions are derived automatically.
+A ``system.conf`` could look like this:
+
+.. code-block:: cfg
+
+  [slot.bootloader.0]
+  device=/dev/mmcblk1
+  type=boot-emmc
+
+.. important::
+
+  A kernel bug may prevent consistent toggling of the eMMC ext_csd boot
+  partition register.
+  Be sure your kernel is >= 4.16-rc7 (resp. >= 4.15.14, >= 4.14.31) or contains
+  this patch: https://www.spinics.net/lists/linux-mmc/msg48271.html
+
+Bootloader Update Ideas
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The NXP i.MX6 supports up to four bootloader copies when booting from NAND
+flash.
 The ROM code will try each copy in turn until it finds one which is readable
 without uncorrectable ECC errors and has a correct header.
 By using the trait of NAND flash that interrupted writes cause ECC errors and
@@ -406,14 +559,15 @@ writing the first page (containing the header) last, the bootloader images can
 be replaced one after the other, while ensuring that the system will boot even in
 case of a crash or power failure.
 
-Currently, independent of whether you are able to update your bootloader with
-fallback, atomically or with some risk of an unbootable system, our suggestion
-is to handle updates for it outside of RAUC.
-The main reason is to avoid booting an old system with a new bootloader, as this
-combination is usually not tested during development, increasing the risk of
-problems appearing only in the field.
+The slot type could be called "boot-imx6-nand" analogous to eMMC.
 
-One possible approach to this is:
+Considerations When Updating the Bootloader
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Booting an old system with a new bootloader is usually not tested during
+development, increasing the risk of problems appearing only in the field.
+If you want to address this issue do not add the bootloader to your bundle, but
+rather use an approach like this:
 
 * Store a copy of the bootloader in the rootfs.
 * Use RAUC only to update the rootfs. The combinations to test
@@ -496,14 +650,14 @@ RAUC is rather strict in parsing the manifest and will reject bundles
 containing unknown configuration options.
 
 But, this does not prevent you from being able to use those new RAUC features
-on your current sytem.
+on your current system.
 All you have to do is to perform an *intermediate update*:
 
 * Create a bundle containing a rootfs with the recent RAUC version,
   but *not* containing the new RAUC features in its manifest.
 * Update your system and reboot
 * Now you have a system with a recent RAUC version which is able to
-  interpretate and appropriately handle a bundle with the latest options
+  interpret and appropriately handle a bundle with the latest options
 
 Software Deployment
 -------------------

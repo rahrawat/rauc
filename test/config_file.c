@@ -17,6 +17,20 @@ static void config_file_fixture_set_up(ConfigFileFixture *fixture,
 {
 	fixture->tmpdir = g_dir_make_tmp("rauc-conf_file-XXXXXX", NULL);
 	g_assert_nonnull(fixture->tmpdir);
+
+	r_context_conf()->configpath = g_strdup("test/test.conf");
+	r_context_conf()->handlerextra = g_strdup("--dummy1 --dummy2");
+	r_context();
+}
+
+static void config_file_fixture_set_up_global(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	fixture->tmpdir = g_dir_make_tmp("rauc-conf_file-XXXXXX", NULL);
+	g_assert_nonnull(fixture->tmpdir);
+
+	r_context_conf()->configpath = g_strdup("test/test-global.conf");
+	r_context();
 }
 
 static void config_file_fixture_tear_down(ConfigFileFixture *fixture,
@@ -41,6 +55,7 @@ static void config_file_full_config(ConfigFileFixture *fixture,
 compatible=FooCorp Super BarBazzer\n\
 bootloader=barebox\n\
 mountprefix=/mnt/myrauc/\n\
+statusfile=/mnt/persistent-rw-fs/system.raucs\n\
 \n\
 [keyring]\n\
 path=/etc/rauc/keyring/\n\
@@ -91,6 +106,7 @@ ignore-checksum=true\n";
 	g_assert_cmpstr(config->system_bootloader, ==, "barebox");
 	g_assert_cmpstr(config->mount_prefix, ==, "/mnt/myrauc/");
 	g_assert_true(config->activate_installed);
+	g_assert_cmpstr(config->statusfile_path, ==, "/mnt/persistent-rw-fs/system.raucs");
 
 	g_assert_nonnull(config->slots);
 	slotlist = g_hash_table_get_keys(config->slots);
@@ -208,7 +224,7 @@ bootloader=barebox\n\
 [slot.child.0]\n\
 device=/dev/null\n\
 parent=invalid\n\
-	";
+\t";
 
 
 	pathname = write_tmp_file(fixture->tmpdir, "nonexisting_bootloader.conf", nonexisting_parent, NULL);
@@ -361,34 +377,34 @@ static void config_file_system_variant(ConfigFileFixture *fixture,
 	GError *ierror = NULL;
 	gchar* pathname;
 
-	const gchar *cfg_file_no_variant= "\
+	const gchar *cfg_file_no_variant = "\
 [system]\n\
 compatible=FooCorp Super BarBazzer\n\
 bootloader=barebox\n\
 mountprefix=/mnt/myrauc/";
 
-	const gchar *cfg_file_name_variant= "\
+	const gchar *cfg_file_name_variant = "\
 [system]\n\
 compatible=FooCorp Super BarBazzer\n\
 bootloader=barebox\n\
 mountprefix=/mnt/myrauc/\n\
 variant-name=variant-name";
 
-	const gchar *cfg_file_dtb_variant= "\
+	const gchar *cfg_file_dtb_variant = "\
 [system]\n\
 compatible=FooCorp Super BarBazzer\n\
 bootloader=barebox\n\
 mountprefix=/mnt/myrauc/\n\
 variant-dtb=true";
 
-	const gchar *cfg_file_file_variant= "\
+	const gchar *cfg_file_file_variant = "\
 [system]\n\
 compatible=FooCorp Super BarBazzer\n\
 bootloader=barebox\n\
 mountprefix=/mnt/myrauc/\n\
 variant-file=/path/to/file";
 
-	const gchar *cfg_file_conflicting_variants= "\
+	const gchar *cfg_file_conflicting_variants = "\
 [system]\n\
 compatible=FooCorp Super BarBazzer\n\
 bootloader=barebox\n\
@@ -452,10 +468,36 @@ variant-name=";
 
 
 
+static void config_file_statusfile_missing(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	RaucConfig *config;
+	GError *ierror = NULL;
+	gchar* pathname;
+
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+mountprefix=/mnt/myrauc/\n";
+
+
+	pathname = write_tmp_file(fixture->tmpdir, "valid_bootloader.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_true(load_config(pathname, &config, &ierror));
+	g_assert_null(ierror);
+	g_assert_nonnull(config);
+	g_assert_null(config->statusfile_path);
+
+	free_config(config);
+}
+
+
 static void config_file_test_read_slot_status(void)
 {
-	RaucSlotStatus *ss;
-	g_assert_true(read_slot_status("test/rootfs.raucs", &ss, NULL));
+	RaucSlotStatus *ss = g_new0(RaucSlotStatus, 1);
+	g_assert_true(read_slot_status("test/rootfs.raucs", ss, NULL));
 	g_assert_nonnull(ss);
 	g_assert_cmpstr(ss->status, ==, "ok");
 	g_assert_cmpint(ss->checksum.type, ==, G_CHECKSUM_SHA256);
@@ -477,8 +519,9 @@ static void config_file_test_write_slot_status(void)
 	write_slot_status("test/savedslot.raucs", ss, NULL);
 
 	free_slot_status(ss);
+	ss = g_new0(RaucSlotStatus, 1);
 
-	read_slot_status("test/savedslot.raucs", &ss, NULL);
+	read_slot_status("test/savedslot.raucs", ss, NULL);
 
 	g_assert_nonnull(ss);
 	g_assert_cmpstr(ss->status, ==, "ok");
@@ -495,46 +538,99 @@ static void config_file_system_serial(void)
 	g_assert_cmpstr(r_context()->system_serial, ==, "1234");
 }
 
+static void config_file_test_global_slot_status(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	GHashTable *slots = r_context()->config->slots;
+	GHashTableIter iter;
+	GError *ierror = NULL;
+	RaucSlot *slot;
+
+	g_assert_nonnull(r_context()->config->statusfile_path);
+
+	/* Set status for all slots */
+	g_hash_table_iter_init(&iter, slots);
+	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
+		if (slot->status)
+			free_slot_status(slot->status);
+
+		g_debug("Set default status for slot %s.", slot->name);
+		slot->status = g_new0(RaucSlotStatus, 1);
+		slot->status->status = g_strdup("ok");
+		slot->status->checksum.type = G_CHECKSUM_SHA256;
+		slot->status->checksum.digest = g_strdup("dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551");
+	}
+
+	/* Save status for all slots */
+	g_hash_table_iter_init(&iter, slots);
+	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
+		save_slot_status(slot, &ierror);
+		g_assert_no_error(ierror);
+	}
+
+	/* Clear status for all slots */
+	g_hash_table_iter_init(&iter, slots);
+	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
+		if (slot->status)
+			free_slot_status(slot->status);
+
+		slot->status = NULL;
+	}
+
+	/* Check status for all slots */
+	g_hash_table_iter_init(&iter, slots);
+	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
+		load_slot_status(slot);
+		g_assert_nonnull(slot->status);
+		g_assert_cmpstr(slot->status->status, ==, "ok");
+		g_assert_cmpint(slot->status->checksum.type, ==, G_CHECKSUM_SHA256);
+		g_assert_cmpstr(slot->status->checksum.digest, ==,
+				"dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551");
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	setlocale(LC_ALL, "C");
 
 	g_test_init(&argc, &argv, NULL);
 
-	r_context_conf()->configpath = g_strdup("test/test.conf");
-	r_context_conf()->handlerextra = g_strdup("--dummy1 --dummy2");
-	r_context();
-
 	g_test_add("/config-file/full-config", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_full_config,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_full_config,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/bootloaders", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_bootloaders,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_bootloaders,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/invalid-parent", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_invalid_parent,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_invalid_parent,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/typo-in-boolean-readonly-key", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_typo_in_boolean_readonly_key,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_typo_in_boolean_readonly_key,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/typo-in-boolean-ignore-checksum-key", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_typo_in_boolean_ignore_checksum_key,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_typo_in_boolean_ignore_checksum_key,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/typo-in-boolean-activate-installed-key", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_typo_in_boolean_activate_installed_key,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_typo_in_boolean_activate_installed_key,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/activate-installed-key-set-to-true", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_activate_installed_set_to_true,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_activate_installed_set_to_true,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/activate-installed-key-set-to-false", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_activate_installed_set_to_false,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_activate_installed_set_to_false,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/system-variant", ConfigFileFixture, NULL,
-		   config_file_fixture_set_up, config_file_system_variant,
-		   config_file_fixture_tear_down);
+			config_file_fixture_set_up, config_file_system_variant,
+			config_file_fixture_tear_down);
 	g_test_add_func("/config-file/read-slot-status", config_file_test_read_slot_status);
 	g_test_add_func("/config-file/write-read-slot-status", config_file_test_write_slot_status);
 	g_test_add_func("/config-file/system-serial", config_file_system_serial);
+	g_test_add("/config-file/statusfile-missing", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_statusfile_missing,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/global-slot-staus", ConfigFileFixture, NULL,
+			config_file_fixture_set_up_global, config_file_test_global_slot_status,
+			config_file_fixture_tear_down);
 
-	return g_test_run ();
+	return g_test_run();
 }

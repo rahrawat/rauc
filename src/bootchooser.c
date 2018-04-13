@@ -1,5 +1,3 @@
-#include <config.h>
-
 #include <string.h>
 #include <errno.h>
 #include <gio/gio.h>
@@ -9,9 +7,9 @@
 #include "context.h"
 #include "install.h"
 
-GQuark r_bootchooser_error_quark (void)
+GQuark r_bootchooser_error_quark(void)
 {
-  return g_quark_from_static_string ("r_bootchooser_error_quark");
+	return g_quark_from_static_string("r_bootchooser_error_quark");
 }
 
 #define BAREBOX_STATE_NAME "barebox-state"
@@ -23,7 +21,8 @@ GQuark r_bootchooser_error_quark (void)
 #define UBOOT_FWGETENV_NAME "fw_printenv"
 #define EFIBOOTMGR_NAME "efibootmgr"
 
-static GString *bootchooser_order_primay(RaucSlot *slot) {
+static GString *bootchooser_order_primay(RaucSlot *slot)
+{
 	GString *order = g_string_sized_new(10);
 	GList *slots;
 
@@ -54,7 +53,8 @@ typedef struct {
 
 #define BOOTSTATE_PREFIX "bootstate"
 
-static gboolean barebox_state_get(const gchar* bootname, BareboxSlotState *bb_state, GError **error) {
+static gboolean barebox_state_get(const gchar* bootname, BareboxSlotState *bb_state, GError **error)
+{
 	GSubprocess *sub;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -63,12 +63,16 @@ static gboolean barebox_state_get(const gchar* bootname, BareboxSlotState *bb_st
 	gchar* outline;
 	guint64 result[2] = {};
 	GPtrArray *args = g_ptr_array_new_full(6, g_free);
-	
+
 	g_return_val_if_fail(bootname, FALSE);
 	g_return_val_if_fail(bb_state, FALSE);
 	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	g_ptr_array_add(args, g_strdup(BAREBOX_STATE_NAME));
+	if (r_context()->config->system_bb_statename) {
+		g_ptr_array_add(args, g_strdup("-n"));
+		g_ptr_array_add(args, g_strdup(r_context()->config->system_bb_statename));
+	}
 	g_ptr_array_add(args, g_strdup("-g"));
 	g_ptr_array_add(args, g_strdup_printf(BOOTSTATE_PREFIX ".%s.priority", bootname));
 	g_ptr_array_add(args, g_strdup("-g"));
@@ -76,7 +80,7 @@ static gboolean barebox_state_get(const gchar* bootname, BareboxSlotState *bb_st
 	g_ptr_array_add(args, NULL);
 
 	sub = g_subprocess_newv((const gchar * const *)args->pdata,
-				  G_SUBPROCESS_FLAGS_STDOUT_PIPE, &ierror);
+			G_SUBPROCESS_FLAGS_STDOUT_PIPE, &ierror);
 	if (!sub) {
 		g_propagate_prefixed_error(
 				error,
@@ -145,7 +149,8 @@ out:
 
 
 /* names: list of gchar, values: list of gint */
-static gboolean barebox_state_set(GPtrArray *pairs, GError **error) {
+static gboolean barebox_state_set(GPtrArray *pairs, GError **error)
+{
 	GSubprocess *sub;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -155,8 +160,12 @@ static gboolean barebox_state_set(GPtrArray *pairs, GError **error) {
 	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	g_assert_cmpuint(pairs->len, >, 0);
-	
+
 	g_ptr_array_add(args, g_strdup(BAREBOX_STATE_NAME));
+	if (r_context()->config->system_bb_statename) {
+		g_ptr_array_add(args, g_strdup("-n"));
+		g_ptr_array_add(args, g_strdup(r_context()->config->system_bb_statename));
+	}
 	for (guint i = 0; i < pairs->len; i++) {
 		g_ptr_array_add(args, g_strdup("-s"));
 		g_ptr_array_add(args, g_strdup(pairs->pdata[i]));
@@ -164,7 +173,7 @@ static gboolean barebox_state_set(GPtrArray *pairs, GError **error) {
 	g_ptr_array_add(args, NULL);
 
 	sub = g_subprocess_newv((const gchar * const *)args->pdata,
-				  G_SUBPROCESS_FLAGS_NONE, &ierror);
+			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (!sub) {
 		g_propagate_prefixed_error(
 				error,
@@ -188,7 +197,8 @@ out:
 }
 
 /* Set slot status values */
-static gboolean barebox_set_state(RaucSlot *slot, gboolean good, GError **error) {
+static gboolean barebox_set_state(RaucSlot *slot, gboolean good, GError **error)
+{
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	GPtrArray *pairs = g_ptr_array_new_full(10, g_free);
@@ -203,11 +213,11 @@ static gboolean barebox_set_state(RaucSlot *slot, gboolean good, GError **error)
 		/* for marking bad, also set priority to 0 */
 		attempts = 0;
 		g_ptr_array_add(pairs, g_strdup_printf(BOOTSTATE_PREFIX ".%s.priority=%i",
-				slot->bootname, 0));
+						slot->bootname, 0));
 	}
 
 	g_ptr_array_add(pairs, g_strdup_printf(BOOTSTATE_PREFIX ".%s.remaining_attempts=%i",
-			slot->bootname, attempts));
+					slot->bootname, attempts));
 
 	res = barebox_state_set(pairs, &ierror);
 	if (!res) {
@@ -222,7 +232,8 @@ out:
 }
 
 /* Get slot marked as primary one */
-static RaucSlot* barebox_get_primary(GError **error) {
+static RaucSlot* barebox_get_primary(GError **error)
+{
 	RaucSlot *slot;
 	GHashTableIter iter;
 	RaucSlot *primary = NULL;
@@ -231,8 +242,7 @@ static RaucSlot* barebox_get_primary(GError **error) {
 	gboolean res;
 
 	g_hash_table_iter_init(&iter, r_context()->config->slots);
-
-	while (g_hash_table_iter_next(&iter, NULL, (gpointer *)&slot)) {
+	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
 		BareboxSlotState state;
 
 		if (!slot->bootname)
@@ -268,7 +278,8 @@ static RaucSlot* barebox_get_primary(GError **error) {
 
 /* We assume a slot to be 'good' if its priority is > 0 AND its remaining
  * attempts counter is > 0 */
-static gboolean barebox_get_state(RaucSlot *slot, gboolean *good, GError **error) {
+static gboolean barebox_get_state(RaucSlot *slot, gboolean *good, GError **error)
+{
 	BareboxSlotState state;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -289,7 +300,8 @@ out:
 }
 
 /* Set slot as primary boot slot */
-static gboolean barebox_set_primary(RaucSlot *slot, GError **error) {
+static gboolean barebox_set_primary(RaucSlot *slot, GError **error)
+{
 	GPtrArray *pairs = g_ptr_array_new_full(10, g_free);
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -324,11 +336,11 @@ static gboolean barebox_set_primary(RaucSlot *slot, GError **error) {
 				prio = BAREBOX_STATE_DEFAULT_PRIORITY;
 		}
 		g_ptr_array_add(pairs, g_strdup_printf(BOOTSTATE_PREFIX ".%s.priority=%i",
-				s->bootname, prio));
+						s->bootname, prio));
 	}
 
 	g_ptr_array_add(pairs, g_strdup_printf(BOOTSTATE_PREFIX ".%s.remaining_attempts=%i",
-			slot->bootname, BAREBOX_STATE_ATTEMPS_PRIMARY));
+					slot->bootname, BAREBOX_STATE_ATTEMPS_PRIMARY));
 
 	res = barebox_state_set(pairs, &ierror);
 	if (!res) {
@@ -342,7 +354,8 @@ out:
 	return res;
 }
 
-static gboolean grub_env_set(GPtrArray *pairs, GError **error) {
+static gboolean grub_env_set(GPtrArray *pairs, GError **error)
+{
 	GSubprocess *sub;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -359,7 +372,7 @@ static gboolean grub_env_set(GPtrArray *pairs, GError **error) {
 	g_ptr_array_add(pairs, NULL);
 
 	sub = g_subprocess_newv((const gchar * const *)pairs->pdata,
-				  G_SUBPROCESS_FLAGS_NONE, &ierror);
+			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (!sub) {
 		g_propagate_prefixed_error(
 				error,
@@ -386,7 +399,8 @@ out:
 }
 
 /* Set slot status values */
-static gboolean grub_set_state(RaucSlot *slot, gboolean good, GError **error) {
+static gboolean grub_set_state(RaucSlot *slot, gboolean good, GError **error)
+{
 	GPtrArray *pairs = g_ptr_array_new_full(10, g_free);
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -415,7 +429,8 @@ out:
 }
 
 /* Set slot as primary boot slot */
-static gboolean grub_set_primary(RaucSlot *slot, GError **error) {
+static gboolean grub_set_primary(RaucSlot *slot, GError **error)
+{
 	GPtrArray *pairs = g_ptr_array_new_full(10, g_free);
 	GString *order = NULL;
 	GError *ierror = NULL;
@@ -444,7 +459,8 @@ out:
 	return res;
 }
 
-static gboolean uboot_env_get(const gchar *key, GString **value, GError **error) {
+static gboolean uboot_env_get(const gchar *key, GString **value, GError **error)
+{
 	GSubprocess *sub;
 	GError *ierror = NULL;
 	GBytes *stdout_buf = NULL;
@@ -459,7 +475,7 @@ static gboolean uboot_env_get(const gchar *key, GString **value, GError **error)
 	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	sub = g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE, &ierror,
-			       UBOOT_FWGETENV_NAME, key, NULL);
+			UBOOT_FWGETENV_NAME, key, NULL);
 	if (!sub) {
 		g_propagate_prefixed_error(
 				error,
@@ -510,7 +526,8 @@ out:
 	return res;
 }
 
-static gboolean uboot_env_set(const gchar *key, const gchar *value, GError **error) {
+static gboolean uboot_env_set(const gchar *key, const gchar *value, GError **error)
+{
 	GSubprocess *sub;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -520,7 +537,7 @@ static gboolean uboot_env_set(const gchar *key, const gchar *value, GError **err
 	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	sub = g_subprocess_new(G_SUBPROCESS_FLAGS_NONE, &ierror, UBOOT_FWSETENV_NAME,
-			       key, value, NULL);
+			key, value, NULL);
 	if (!sub) {
 		g_propagate_prefixed_error(
 				error,
@@ -543,7 +560,8 @@ out:
 }
 
 /* Set slot status values */
-static gboolean uboot_set_state(RaucSlot *slot, gboolean good, GError **error) {
+static gboolean uboot_set_state(RaucSlot *slot, gboolean good, GError **error)
+{
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	gchar *key = NULL;
@@ -565,7 +583,8 @@ out:
 }
 
 /* Set slot as primary boot slot */
-static gboolean uboot_set_primary(RaucSlot *slot, GError **error) {
+static gboolean uboot_set_primary(RaucSlot *slot, GError **error)
+{
 	GString *order_new = g_string_sized_new(10);
 	GString *order_current = NULL;
 	gchar **bootnames = NULL;
@@ -630,7 +649,8 @@ typedef struct {
 	gboolean active;
 } efi_bootentry;
 
-static gboolean efi_bootorder_set(gchar *order, GError **error) {
+static gboolean efi_bootorder_set(gchar *order, GError **error)
+{
 	GSubprocess *sub;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -640,7 +660,7 @@ static gboolean efi_bootorder_set(gchar *order, GError **error) {
 
 
 	sub = g_subprocess_new(G_SUBPROCESS_FLAGS_NONE, &ierror, "efibootmgr",
-			       "--bootorder", order, NULL);
+			"--bootorder", order, NULL);
 
 	if (!sub) {
 		g_propagate_prefixed_error(
@@ -664,7 +684,8 @@ out:
 	return res;
 }
 
-static gboolean efi_set_bootnext(gchar *bootnumber, GError **error) {
+static gboolean efi_set_bootnext(gchar *bootnumber, GError **error)
+{
 	GSubprocess *sub;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -673,7 +694,7 @@ static gboolean efi_set_bootnext(gchar *bootnumber, GError **error) {
 	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	sub = g_subprocess_new(G_SUBPROCESS_FLAGS_NONE, &ierror, "efibootmgr",
-			       "--bootnext", bootnumber, NULL);
+			"--bootnext", bootnumber, NULL);
 
 	if (!sub) {
 		g_propagate_prefixed_error(
@@ -697,7 +718,8 @@ out:
 	return res;
 }
 
-static efi_bootentry* get_efi_entry_by_bootnum(GList *entries, const gchar *bootnum) {
+static efi_bootentry* get_efi_entry_by_bootnum(GList *entries, const gchar *bootnum)
+{
 	efi_bootentry *found_entry = NULL;
 
 	g_return_val_if_fail(entries, NULL);
@@ -717,14 +739,15 @@ static efi_bootentry* get_efi_entry_by_bootnum(GList *entries, const gchar *boot
 /* Parses output of efibootmgr and returns information obtained.
  *
  * @param bootorder_entries Return location for List (of efi_bootentry
- * 	  elements) of slots that are currently in EFI 'BootOrder'
+ *        elements) of slots that are currently in EFI 'BootOrder'
  * @param all_entries Return location for List (of efi_bootentry element) of
- * 	  all EFI boot entries
+ *        all EFI boot entries
  * @param bootnext Return location for EFI boot slot currently selected as
- * 	  'BootNext' (if any)
+ *        'BootNext' (if any)
  * @param error Return location for a GError
  */
-static gboolean efi_bootorder_get(GList **bootorder_entries, GList **all_entries, efi_bootentry **bootnext, GError **error) {
+static gboolean efi_bootorder_get(GList **bootorder_entries, GList **all_entries, efi_bootentry **bootnext, GError **error)
+{
 	GSubprocess *sub = NULL;
 	GError *ierror = NULL;
 	GBytes *stdout_buf = NULL;
@@ -742,7 +765,7 @@ static gboolean efi_bootorder_get(GList **bootorder_entries, GList **all_entries
 	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	sub = g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE, &ierror,
-			       EFIBOOTMGR_NAME, NULL);
+			EFIBOOTMGR_NAME, NULL);
 	if (!sub) {
 		g_propagate_prefixed_error(
 				error,
@@ -851,7 +874,8 @@ out:
 	return res;
 }
 
-static gboolean efi_set_temp_primary(RaucSlot *slot, GError **error) {
+static gboolean efi_set_temp_primary(RaucSlot *slot, GError **error)
+{
 	GList *entries = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
@@ -895,7 +919,8 @@ out:
 
 /* Deletes given slot from efi bootorder list.
  * Prepends it to bootorder list if prepend arguemnt is set to TRUE */
-static gboolean efi_modify_persistent_bootorder(RaucSlot *slot, gboolean prepend, GError **error) {
+static gboolean efi_modify_persistent_bootorder(RaucSlot *slot, gboolean prepend, GError **error)
+{
 	GList *entries = NULL;
 	GList *all_entries = NULL;
 	GPtrArray *bootorder = NULL;
@@ -969,7 +994,8 @@ out:
 	return res;
 }
 
-static gboolean efi_set_state(RaucSlot *slot, gboolean good, GError **error) {
+static gboolean efi_set_state(RaucSlot *slot, gboolean good, GError **error)
+{
 	gboolean res = FALSE;
 	GError *ierror = NULL;
 
@@ -987,7 +1013,8 @@ out:
 	return res;
 }
 
-static RaucSlot *efi_get_primary(GError **error) {
+static RaucSlot *efi_get_primary(GError **error)
+{
 	GList *bootorder_entries = NULL;
 	gboolean res = FALSE;
 	GError *ierror = NULL;
@@ -1015,7 +1042,7 @@ static RaucSlot *efi_get_primary(GError **error) {
 
 		/* find matching slot entry */
 		g_hash_table_iter_init(&iter, r_context()->config->slots);
-		while (g_hash_table_iter_next(&iter, NULL, (gpointer *)&slot)) {
+		while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
 			if (g_strcmp0(bootentry->name, slot->bootname) == 0) {
 				primary = slot;
 				break;
@@ -1041,7 +1068,8 @@ out:
 	return res ? primary : NULL;
 }
 
-static gboolean efi_set_primary(RaucSlot *slot, GError **error) {
+static gboolean efi_set_primary(RaucSlot *slot, GError **error)
+{
 	gboolean res = FALSE;
 	GError *ierror = NULL;
 
@@ -1061,7 +1089,8 @@ out:
 
 /* We assume bootstate to be good if slot is listed in 'bootorder', otherwise
  * bad */
-static gboolean efi_get_state(RaucSlot* slot, gboolean *good, GError **error)  {
+static gboolean efi_get_state(RaucSlot* slot, gboolean *good, GError **error)
+{
 	efi_bootentry *found_entry = NULL;
 	gboolean res = FALSE;
 	GError *ierror = NULL;
@@ -1092,7 +1121,8 @@ out:
 	return res;
 }
 
-gboolean r_boot_get_state(RaucSlot* slot, gboolean *good, GError **error)  {
+gboolean r_boot_get_state(RaucSlot* slot, gboolean *good, GError **error)
+{
 	gboolean res = FALSE;
 	GError *ierror = NULL;
 
@@ -1123,7 +1153,8 @@ gboolean r_boot_get_state(RaucSlot* slot, gboolean *good, GError **error)  {
 	return res;
 }
 
-gboolean r_boot_set_state(RaucSlot *slot, gboolean good, GError **error) {
+gboolean r_boot_set_state(RaucSlot *slot, gboolean good, GError **error)
+{
 	gboolean res = FALSE;
 	GError *ierror = NULL;
 
@@ -1160,7 +1191,8 @@ gboolean r_boot_set_state(RaucSlot *slot, gboolean good, GError **error) {
 	return res;
 }
 
-RaucSlot* r_boot_get_primary(GError **error) {
+RaucSlot* r_boot_get_primary(GError **error)
+{
 	RaucSlot *slot = NULL;
 	GError *ierror = NULL;
 
@@ -1189,7 +1221,8 @@ RaucSlot* r_boot_get_primary(GError **error) {
 	return slot;
 }
 
-gboolean r_boot_set_primary(RaucSlot *slot, GError **error) {
+gboolean r_boot_set_primary(RaucSlot *slot, GError **error)
+{
 	gboolean res = FALSE;
 	GError *ierror = NULL;
 

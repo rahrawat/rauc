@@ -15,7 +15,7 @@ CODE_COVERAGE_IGNORE_PATTERN = "*-generated.c"
 
 AM_CFLAGS = -DG_LOG_DOMAIN=\"rauc\" $(WARN_CFLAGS) $(GLIB_CFLAGS) $(CURL_CFLAGS)
 AM_LDFLAGS = $(WARN_LDFLAGS) $(GLIB_LDFLAGS) $(CURL_LDFLAGS) $(OPENSSL_LDFLAGS)
-AM_CPPFLAGS = -I${top_srcdir}/include $(OPENSSL_INCLUDES)
+AM_CPPFLAGS = -I${top_srcdir}/include -include ${top_builddir}/config.h $(OPENSSL_INCLUDES)
 
 gdbus_installer_generated = \
 	rauc-installer-generated.c \
@@ -39,6 +39,7 @@ librauc_la_SOURCES = \
 	src/checksum.c \
 	src/config_file.c \
 	src/context.c \
+	src/emmc.c \
 	src/install.c \
 	src/manifest.c \
 	src/mark.c \
@@ -52,6 +53,7 @@ librauc_la_SOURCES = \
 	include/checksum.h \
 	include/config_file.h \
 	include/context.h \
+	include/emmc.h \
 	include/install.h \
 	include/manifest.h \
 	include/mark.h \
@@ -90,7 +92,7 @@ dbuspolicydir = $(DBUS_POLICYDIR)
 dist_dbuspolicy_DATA = data/de.pengutronix.rauc.conf
 
 dbuswrapperdir = $(libexecdir)
-dist_dbuswrapper_SCRIPTS = data/rauc-service.sh
+nodist_dbuswrapper_SCRIPTS = data/rauc-service.sh
 
 EXTRA_DIST += data/rauc.service.in \
 	      data/de.pengutronix.rauc.service.in \
@@ -134,7 +136,8 @@ EXTRA_DIST += tap-t \
 	      test/rauc.t \
 	      test/rootfs.raucs \
 	      test/sharness.sh \
-	      test/test.conf
+	      test/test.conf \
+	      test/test-global.conf
 
 librauctest_la_SOURCES = \
 	test/common.c \
@@ -192,8 +195,8 @@ data/%: data/%.in
 SPHINXOPTS          =
 SPHINXBUILD         = sphinx-build
 PAPER               =
-DOCDIR              = docs
-SPHINXBUILDDIR      = $(DOCDIR)/build
+DOCDIR              = $(top_srcdir)/docs
+SPHINXBUILDDIR      = $(top_builddir)/docs/build
 
 .PHONY: check-valgrind check-valgrind-tool
 
@@ -210,7 +213,7 @@ AM_DISTCHECK_CONFIGURE_FLAGS = "--without-systemdunitdir"
 CLEANFILES = $(gdbus_installer_generated) \
 	     $(nodist_systemdunit_DATA) \
 	     $(nodist_dbussystem_DATA) \
-	     $(dist_dbuswrapper_SCRIPTS) \
+	     $(nodist_dbuswrapper_SCRIPTS) \
 	     data/rauc.service \
 	     test/empty.dat \
 	     test/test-results/rauc.*.counts \
@@ -218,4 +221,6 @@ CLEANFILES = $(gdbus_installer_generated) \
 	     test/savedslot.raucs \
 	     test/grubenv.test \
 	     test/random.dat \
-	     test/test-temp.conf
+	     test/test-temp.conf \
+	     test/system.raucs \
+	     test/global.raucs

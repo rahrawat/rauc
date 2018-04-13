@@ -1,5 +1,3 @@
-#include <config.h>
-
 #include <gio/gio.h>
 #include <glib.h>
 #include <glib/gstdio.h>
@@ -17,6 +15,7 @@
 #include "rauc-installer-generated.h"
 #include "service.h"
 #include "signature.h"
+#include "update_handler.h"
 #include "utils.h"
 #include "mark.h"
 
@@ -25,9 +24,11 @@ int r_exit_status = 0;
 
 gboolean install_ignore_compatible = FALSE;
 gboolean info_noverify, info_dumpcert = FALSE;
+gboolean status_detailed = FALSE;
 gchar *output_format = NULL;
 
-static gboolean install_notify(gpointer data) {
+static gboolean install_notify(gpointer data)
+{
 	RaucInstallArgs *args = data;
 
 	g_mutex_lock(&args->status_mutex);
@@ -49,8 +50,9 @@ static gboolean install_cleanup(gpointer data)
 }
 
 static void on_installer_changed(GDBusProxy *proxy, GVariant *changed,
-				 const gchar* const *invalidated,
-				 gpointer data) {
+		const gchar* const *invalidated,
+		gpointer data)
+{
 	RaucInstallArgs *args = data;
 	gchar *msg;
 	gint32 percentage, depth;
@@ -69,7 +71,7 @@ static void on_installer_changed(GDBusProxy *proxy, GVariant *changed,
 	if (g_variant_lookup(changed, "Operation", "s", &msg)) {
 		g_queue_push_tail(&args->status_messages, g_strdup(msg));
 	} else if (g_variant_lookup(changed, "Progress", "(isi)", &percentage, &message, &depth)) {
-		g_queue_push_tail(&args->status_messages, g_strdup_printf("%3"G_GINT32_FORMAT"%% %s", percentage, message));
+		g_queue_push_tail(&args->status_messages, g_strdup_printf("%3"G_GINT32_FORMAT "%% %s", percentage, message));
 	} else if (g_variant_lookup(changed, "LastError", "s", &message) && message[0] != '\0') {
 		g_queue_push_tail(&args->status_messages, g_strdup_printf("LastError: %s", message));
 	}
@@ -81,7 +83,8 @@ static void on_installer_changed(GDBusProxy *proxy, GVariant *changed,
 }
 
 static void on_installer_completed(GDBusProxy *proxy, gint result,
-				   gpointer data) {
+		gpointer data)
+{
 	RaucInstallArgs *args = data;
 
 	g_mutex_lock(&args->status_mutex);
@@ -96,7 +99,7 @@ static void on_installer_completed(GDBusProxy *proxy, gint result,
 static gboolean install_start(int argc, char **argv)
 {
 	GBusType bus_type = (!g_strcmp0(g_getenv("DBUS_STARTER_BUS_TYPE"), "session"))
-		? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
+	                    ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
 	RInstaller *installer = NULL;
 	RaucInstallArgs *args = NULL;
 	GError *error = NULL;
@@ -132,7 +135,7 @@ static gboolean install_start(int argc, char **argv)
 			goto out;
 		}
 
-		if (!g_file_test (bundlelocation, G_FILE_TEST_EXISTS)) {
+		if (!g_file_test(bundlelocation, G_FILE_TEST_EXISTS)) {
 			g_printerr("No such file: %s\n", bundlelocation);
 			g_clear_pointer(&bundlelocation, g_free);
 			goto out;
@@ -152,28 +155,28 @@ static gboolean install_start(int argc, char **argv)
 	r_loop = g_main_loop_new(NULL, FALSE);
 	if (ENABLE_SERVICE) {
 		installer = r_installer_proxy_new_for_bus_sync(bus_type,
-			G_DBUS_PROXY_FLAGS_GET_INVALIDATED_PROPERTIES,
-			"de.pengutronix.rauc", "/", NULL, &error);
+				G_DBUS_PROXY_FLAGS_GET_INVALIDATED_PROPERTIES,
+				"de.pengutronix.rauc", "/", NULL, &error);
 		if (installer == NULL) {
 			g_printerr("Error creating proxy: %s\n", error->message);
-			g_error_free (error);
+			g_error_free(error);
 			goto out_loop;
 		}
 		if (g_signal_connect(installer, "g-properties-changed",
-				     G_CALLBACK(on_installer_changed), args) <= 0) {
+				    G_CALLBACK(on_installer_changed), args) <= 0) {
 			g_printerr("Failed to connect properties-changed signal\n");
 			goto out_loop;
 		}
 		if (g_signal_connect(installer, "completed",
-				     G_CALLBACK(on_installer_completed), args) <= 0) {
+				    G_CALLBACK(on_installer_completed), args) <= 0) {
 			g_printerr("Failed to connect completed signal\n");
 			goto out_loop;
 		}
 		g_debug("Trying to contact rauc service");
 		if (!r_installer_call_install_sync(installer, bundlelocation, NULL,
-						   &error)) {
+				    &error)) {
 			g_printerr("Failed %s\n", error->message);
-			g_error_free (error);
+			g_error_free(error);
 			goto out_loop;
 		}
 	} else {
@@ -259,6 +262,93 @@ static gboolean bundle_start(int argc, char **argv)
 	}
 
 out:
+	return TRUE;
+}
+
+static gboolean write_slot_start(int argc, char **argv)
+{
+	GError *ierror = NULL;
+	RaucImage *image = g_new0(RaucImage, 1);
+	RaucSlot *slot = g_new0(RaucSlot, 1);
+	GFileInfo *info = NULL;
+	GInputStream *instream = NULL;
+	GFile *imagefile = NULL;
+	img_to_slot_handler update_handler = NULL;
+
+	g_debug("write_slot_start");
+
+	if (argc < 3) {
+		g_printerr("A target slot name must be provided\n");
+		r_exit_status = 1;
+		goto out;
+	}
+
+	if (argc < 4) {
+		g_printerr("An image must be provided\n");
+		r_exit_status = 1;
+		goto out;
+	}
+
+	if (argc > 4) {
+		g_printerr("Excess argument: %s\n", argv[4]);
+		goto out;
+	}
+
+	/* construct RaucImage with required attributes */
+	imagefile = g_file_new_for_path(argv[3]);
+	instream = (GInputStream*)g_file_read(imagefile, NULL, &ierror);
+	if (instream == NULL) {
+		g_printerr("%s\n", ierror->message);
+		g_clear_error(&ierror);
+		r_exit_status = 1;
+		goto out;
+	}
+
+	info = g_file_input_stream_query_info(G_FILE_INPUT_STREAM(instream),
+			G_FILE_ATTRIBUTE_STANDARD_SIZE, NULL, &ierror);
+	if (info == NULL) {
+		g_printerr("%s\n", ierror->message);
+		g_clear_error(&ierror);
+		r_exit_status = 1;
+		goto out;
+	}
+
+	image->checksum.size = g_file_info_get_size(info);
+	image->filename = g_strdup(argv[3]);
+
+	/* retrieve RaucSlot */
+	slot = g_hash_table_lookup(r_context()->config->slots, argv[2]);
+	if (slot == NULL) {
+		g_printerr("No matching slot found for given slot name\n");
+		r_exit_status = 1;
+		goto out;
+	}
+
+	/* retrieve update handler */
+	update_handler = get_update_handler(image, slot, &ierror);
+	if (update_handler == NULL) {
+		g_printerr("%s\n", ierror->message);
+		r_exit_status = 1;
+		goto out;
+	}
+
+	/* call update handler */
+	if (!update_handler(image, slot, NULL, &ierror)) {
+		g_printerr("%s\n", ierror->message);
+		g_clear_error(&ierror);
+		r_exit_status = 1;
+		goto out;
+	}
+
+	g_message("Slot written successfully");
+
+out:
+	g_object_unref(info);
+	g_clear_object(&instream);
+	g_clear_object(&imagefile);
+	g_clear_pointer(&slot, r_free_slot);
+	g_clear_pointer(&image, r_free_image);
+
 	return TRUE;
 }
 
@@ -356,6 +446,59 @@ out:
 	return TRUE;
 }
 
+static gboolean convert_start(int argc, char **argv)
+{
+	RaucBundle *bundle = NULL;
+	GError *ierror = NULL;
+	g_debug("convert start");
+
+	if (r_context()->certpath == NULL ||
+	    r_context()->keypath == NULL) {
+		g_printerr("Cert and key files must be provided\n");
+		r_exit_status = 1;
+		goto out;
+	}
+
+	if (argc < 3) {
+		g_printerr("An input bundle must be provided\n");
+		r_exit_status = 1;
+		goto out;
+	}
+
+	if (argc < 4) {
+		g_printerr("An output bundle name must be provided\n");
+		r_exit_status = 1;
+		goto out;
+	}
+
+	if (argc > 4) {
+		g_printerr("Excess argument: %s\n", argv[4]);
+		goto out;
+	}
+
+	g_debug("input bundle: %s", argv[2]);
+	g_debug("output bundle: %s", argv[3]);
+
+	if (!check_bundle(argv[2], &bundle, TRUE, &ierror)) {
+		g_printerr("%s\n", ierror->message);
+		g_clear_error(&ierror);
+		r_exit_status = 1;
+		goto out;
+	}
+
+	if (!create_casync_bundle(bundle, argv[3], &ierror)) {
+		g_printerr("Failed to create bundle: %s\n", ierror->message);
+		g_clear_error(&ierror);
+		r_exit_status = 1;
+		goto out;
+	}
+
+	g_print("Bundle written to %s\n", argv[3]);
+
+out:
+	return TRUE;
+}
+
 static gboolean checksum_start(int argc, char **argv)
 {
 	GError *error = NULL;
@@ -367,7 +510,7 @@ static gboolean checksum_start(int argc, char **argv)
 	    r_context()->keypath != NULL) {
 		sign = TRUE;
 	} else if (r_context()->certpath != NULL ||
-	    r_context()->keypath != NULL) {
+	           r_context()->keypath != NULL) {
 		g_printerr("Either both or none of cert and key files must be provided\n");
 		r_exit_status = 1;
 		goto out;
@@ -393,15 +536,17 @@ out:
 
 /* Takes a shell variable and its desired argument as input and appends it to
  * the provided text with taking care of correct shell quoting */
-static void formatter_shell_append(GString* text, const gchar* varname, const gchar* argument) {
-	gchar* quoted = g_shell_quote (argument ?: "");
+static void formatter_shell_append(GString* text, const gchar* varname, const gchar* argument)
+{
+	gchar* quoted = g_shell_quote(argument ?: "");
 	g_string_append_printf(text, "%s=%s\n", varname, quoted);
 	g_clear_pointer(&quoted, g_free);
 }
 /* Same as above, expect that it has a cnt argument to add per-slot-number
  * strings */
-static void formatter_shell_append_n(GString* text, const gchar* varname, gint cnt, const gchar* argument) {
-	gchar* quoted = g_shell_quote (argument ?: "");
+static void formatter_shell_append_n(GString* text, const gchar* varname, gint cnt, const gchar* argument)
+{
+	gchar* quoted = g_shell_quote(argument ?: "");
 	g_string_append_printf(text, "%s_%d=%s\n", varname, cnt, quoted);
 	g_clear_pointer(&quoted, g_free);
 }
@@ -439,7 +584,7 @@ static gchar *info_formatter_shell(RaucManifest *manifest)
 		formatter_shell_append_n(text, "RAUC_IMAGE_CLASS", cnt, img->slotclass);
 		formatter_shell_append_n(text, "RAUC_IMAGE_VARIANT", cnt, img->variant);
 		formatter_shell_append_n(text, "RAUC_IMAGE_DIGEST", cnt, img->checksum.digest);
-		g_string_append_printf(text, "RAUC_IMAGE_SIZE_%d=%"G_GSIZE_FORMAT"\n", cnt, img->checksum.size);
+		g_string_append_printf(text, "RAUC_IMAGE_SIZE_%d=%"G_GSIZE_FORMAT "\n", cnt, img->checksum.size);
 
 		hooks = g_ptr_array_new();
 		if (img->hooks.pre_install == TRUE) {
@@ -468,7 +613,7 @@ static gchar *info_formatter_shell(RaucManifest *manifest)
 		g_string_append_printf(text, "RAUC_FILE_CLASS_%d=%s\n", cnt, file->slotclass);
 		g_string_append_printf(text, "RAUC_FILE_DEST_%d=%s\n", cnt, file->destname);
 		g_string_append_printf(text, "RAUC_FILE_DIGEST_%d=%s\n", cnt, file->checksum.digest);
-		g_string_append_printf(text, "RAUC_FILE_SIZE_%d=%"G_GSIZE_FORMAT"\n", cnt, file->checksum.size);
+		g_string_append_printf(text, "RAUC_FILE_SIZE_%d=%"G_GSIZE_FORMAT "\n", cnt, file->checksum.size);
 		cnt++;
 	}
 
@@ -509,7 +654,7 @@ static gchar *info_formatter_readable(RaucManifest *manifest)
 		if (img->variant)
 			g_string_append_printf(text, "\tVariant:   %s\n", img->variant);
 		g_string_append_printf(text, "\tChecksum:  %s\n", img->checksum.digest);
-		g_string_append_printf(text, "\tSize:      %"G_GSIZE_FORMAT"\n", img->checksum.size);
+		g_string_append_printf(text, "\tSize:      %"G_GSIZE_FORMAT "\n", img->checksum.size);
 
 		hooks = g_ptr_array_new();
 		if (img->hooks.pre_install == TRUE) {
@@ -541,7 +686,7 @@ static gchar *info_formatter_readable(RaucManifest *manifest)
 		g_string_append_printf(text, "\tSlotclass: %s\n", file->slotclass);
 		g_string_append_printf(text, "\tDest:      %s\n", file->destname);
 		g_string_append_printf(text, "\tChecksum:  %s\n", file->checksum.digest);
-		g_string_append_printf(text, "\tSize:      %"G_GSIZE_FORMAT"\n", file->checksum.size);
+		g_string_append_printf(text, "\tSize:      %"G_GSIZE_FORMAT "\n", file->checksum.size);
 		cnt++;
 	}
 
@@ -555,76 +700,76 @@ static gchar* info_formatter_json_base(RaucManifest *manifest, gboolean pretty)
 	JsonGenerator *gen;
 	JsonNode * root;
 	gchar *str;
-	JsonBuilder *builder = json_builder_new ();
+	JsonBuilder *builder = json_builder_new();
 
-	json_builder_begin_object (builder);
+	json_builder_begin_object(builder);
 
-	json_builder_set_member_name (builder, "compatible");
-	json_builder_add_string_value (builder, manifest->update_compatible);
+	json_builder_set_member_name(builder, "compatible");
+	json_builder_add_string_value(builder, manifest->update_compatible);
 
-	json_builder_set_member_name (builder, "version");
-	json_builder_add_string_value (builder, manifest->update_version);
+	json_builder_set_member_name(builder, "version");
+	json_builder_add_string_value(builder, manifest->update_version);
 
-	json_builder_set_member_name (builder, "description");
-	json_builder_add_string_value (builder, manifest->update_description);
+	json_builder_set_member_name(builder, "description");
+	json_builder_add_string_value(builder, manifest->update_description);
 
-	json_builder_set_member_name (builder, "build");
-	json_builder_add_string_value (builder, manifest->update_build);
+	json_builder_set_member_name(builder, "build");
+	json_builder_add_string_value(builder, manifest->update_build);
 
-	json_builder_set_member_name (builder, "hooks");
-	json_builder_begin_array (builder);
+	json_builder_set_member_name(builder, "hooks");
+	json_builder_begin_array(builder);
 	if (manifest->hooks.install_check == TRUE) {
-		json_builder_add_string_value (builder, "install-check");
+		json_builder_add_string_value(builder, "install-check");
 	}
-	json_builder_end_array (builder);
+	json_builder_end_array(builder);
 
-	json_builder_set_member_name (builder, "images");
-	json_builder_begin_array (builder);
+	json_builder_set_member_name(builder, "images");
+	json_builder_begin_array(builder);
 
 	for (GList *l = manifest->images; l != NULL; l = l->next) {
 		RaucImage *img = l->data;
 
-		json_builder_begin_object (builder);
-		json_builder_set_member_name (builder, img->slotclass);
-		json_builder_begin_object (builder);
-		json_builder_set_member_name (builder, "variant");
-		json_builder_add_string_value (builder, img->variant);
-		json_builder_set_member_name (builder, "filename");
-		json_builder_add_string_value (builder, img->filename);
-		json_builder_set_member_name (builder, "checksum");
-		json_builder_add_string_value (builder, img->checksum.digest);
-		json_builder_set_member_name (builder, "size");
-		json_builder_add_int_value (builder, img->checksum.size);
-		json_builder_set_member_name (builder, "hooks");
-		json_builder_begin_array (builder);
+		json_builder_begin_object(builder);
+		json_builder_set_member_name(builder, img->slotclass);
+		json_builder_begin_object(builder);
+		json_builder_set_member_name(builder, "variant");
+		json_builder_add_string_value(builder, img->variant);
+		json_builder_set_member_name(builder, "filename");
+		json_builder_add_string_value(builder, img->filename);
+		json_builder_set_member_name(builder, "checksum");
+		json_builder_add_string_value(builder, img->checksum.digest);
+		json_builder_set_member_name(builder, "size");
+		json_builder_add_int_value(builder, img->checksum.size);
+		json_builder_set_member_name(builder, "hooks");
+		json_builder_begin_array(builder);
 		if (img->hooks.pre_install == TRUE) {
-			json_builder_add_string_value (builder, "pre-install");
+			json_builder_add_string_value(builder, "pre-install");
 		}
 		if (img->hooks.install == TRUE) {
-			json_builder_add_string_value (builder, "install");
+			json_builder_add_string_value(builder, "install");
 		}
 		if (img->hooks.post_install == TRUE) {
-			json_builder_add_string_value (builder, "post-install");
+			json_builder_add_string_value(builder, "post-install");
 		}
-		json_builder_end_array (builder);
-		json_builder_end_object (builder);
-		json_builder_end_object (builder);
+		json_builder_end_array(builder);
+		json_builder_end_object(builder);
+		json_builder_end_object(builder);
 
 	}
 
-	json_builder_end_array (builder);
+	json_builder_end_array(builder);
 
-	json_builder_end_object (builder);
+	json_builder_end_object(builder);
 
-	gen = json_generator_new ();
-	root = json_builder_get_root (builder);
-	json_generator_set_root (gen, root);
-	json_generator_set_pretty (gen, pretty);
-	str = json_generator_to_data (gen, NULL);
+	gen = json_generator_new();
+	root = json_builder_get_root(builder);
+	json_generator_set_root(gen, root);
+	json_generator_set_pretty(gen, pretty);
+	str = json_generator_to_data(gen, NULL);
 
-	json_node_free (root);
-	g_object_unref (gen);
-	g_object_unref (builder);
+	json_node_free(root);
+	g_object_unref(gen);
+	g_object_unref(builder);
 
 	return str;
 #else
@@ -700,8 +845,8 @@ static gboolean info_start(int argc, char **argv)
 	if (!res) {
 		g_printerr("%s\n", error->message);
 		g_clear_error(&error);
- 		goto out;
- 	}
+		goto out;
+	}
 
 	res = load_manifest_file(manifestpath, &manifest, &error);
 	if (!res) {
@@ -743,39 +888,14 @@ out:
 	return TRUE;
 }
 
-/* returns string representation of slot state */
-static gchar* slotstate_to_str(SlotState slotstate)
-{
-	gchar *state = NULL;
-
-	switch (slotstate) {
-	case ST_ACTIVE:
-		state = g_strdup("active");
-		break;
-	case ST_INACTIVE:
-		state = g_strdup("inactive");
-		break;
-	case ST_BOOTED:
-		state = g_strdup("booted");
-		break;
-	case ST_UNKNOWN:
-	default:
-		g_error("invalid slot status %d", slotstate);
-		break;
-	}
-
-	return state;
-}
-
-
 static gchar* r_status_formatter_readable(void)
 {
 	GHashTableIter iter;
-	gpointer key, value;
 	gint slotcnt = 0;
 	GString *text = g_string_new(NULL);
 	GError *ierror = NULL;
-	RaucSlot *primary = NULL;
+	RaucSlot *slot, *primary = NULL;
+	gchar *name;
 
 	primary = r_boot_get_primary(&ierror);
 	if (!primary) {
@@ -790,9 +910,8 @@ static gchar* r_status_formatter_readable(void)
 
 	g_string_append(text, "slot states:\n");
 	g_hash_table_iter_init(&iter, r_context()->config->slots);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		gchar *name = key;
-		RaucSlot *slot = value;
+	while (g_hash_table_iter_next(&iter, (gpointer*) &name, (gpointer*) &slot)) {
+		RaucSlotStatus *slot_state = slot->status;
 		gboolean good = FALSE;
 
 		slotcnt++;
@@ -815,8 +934,35 @@ static gchar* r_status_formatter_readable(void)
 			g_string_append(text, ", mountpoint=(none)");
 		if (slot->bootname)
 			g_string_append_printf(text, "\n      boot status=%s", good ? "good" : "bad");
+		if (status_detailed && slot_state) {
+			g_string_append_printf(text, "\n      slot status:");
+			g_string_append_printf(text, "\n          bundle:");
+			g_string_append_printf(text, "\n              compatible=%s", slot_state->bundle_compatible);
+			if (slot_state->bundle_version)
+				g_string_append_printf(text, "\n              version=%s", slot_state->bundle_version);
+			if (slot_state->bundle_description)
+				g_string_append_printf(text, "\n              description=%s", slot_state->bundle_description);
+			if (slot_state->bundle_build)
+				g_string_append_printf(text, "\n              build=%s", slot_state->bundle_build);
+			if (slot_state->checksum.digest && slot_state->checksum.type == G_CHECKSUM_SHA256) {
+				g_string_append_printf(text, "\n          checksum:");
+				g_string_append_printf(text, "\n              sha256=%s", slot_state->checksum.digest);
+				g_string_append_printf(text, "\n              size=%"G_GSIZE_FORMAT, slot_state->checksum.size);
+			}
+			if (slot_state->installed_timestamp) {
+				g_string_append_printf(text, "\n          installed:");
+				g_string_append_printf(text, "\n              timestamp=%s", slot_state->installed_timestamp);
+				g_string_append_printf(text, "\n              count=%u", slot_state->installed_count);
+			}
+			if (slot_state->activated_timestamp) {
+				g_string_append_printf(text, "\n          activated:");
+				g_string_append_printf(text, "\n              timestamp=%s", slot_state->activated_timestamp);
+				g_string_append_printf(text, "\n              count=%u", slot_state->activated_count);
+			}
+			if (slot_state->status)
+				g_string_append_printf(text, "\n          status=%s", slot_state->status);
+		}
 		g_string_append_c(text, '\n');
-
 	}
 
 	return g_string_free(text, FALSE);
@@ -825,13 +971,13 @@ static gchar* r_status_formatter_readable(void)
 static gchar* r_status_formatter_shell(void)
 {
 	GHashTableIter iter;
-	gpointer key, value;
 	gint slotcnt = 0;
 	GString *text = g_string_new(NULL);
 	GPtrArray *slotnames, *slotnumbers = NULL;
 	gchar* slotstring = NULL;
 	GError *ierror = NULL;
-	RaucSlot *primary = NULL;
+	RaucSlot *slot, *primary = NULL;
+	gchar *name;
 
 	primary = r_boot_get_primary(&ierror);
 	if (!primary) {
@@ -847,8 +993,8 @@ static gchar* r_status_formatter_shell(void)
 	slotnames = g_ptr_array_new();
 	slotnumbers = g_ptr_array_new();
 	g_hash_table_iter_init(&iter, r_context()->config->slots);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		g_ptr_array_add(slotnames, (gchar*) key);
+	while (g_hash_table_iter_next(&iter, (gpointer*) &name, NULL)) {
+		g_ptr_array_add(slotnames, name);
 		g_ptr_array_add(slotnumbers, g_strdup_printf("%i", ++slotcnt));
 	}
 	g_ptr_array_add(slotnames, NULL);
@@ -866,8 +1012,8 @@ static gchar* r_status_formatter_shell(void)
 
 	slotcnt = 0;
 	g_hash_table_iter_init(&iter, r_context()->config->slots);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		RaucSlot *slot = value;
+	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
+		RaucSlotStatus *slot_state = slot->status;
 		gboolean good = FALSE;
 
 		slotcnt++;
@@ -888,6 +1034,27 @@ static gchar* r_status_formatter_shell(void)
 			formatter_shell_append_n(text, "RAUC_SLOT_BOOT_STATUS", slotcnt, good ? "good" : "bad");
 		else
 			formatter_shell_append_n(text, "RAUC_SLOT_BOOT_STATUS", slotcnt, NULL);
+		if (status_detailed && slot_state) {
+			gchar *str;
+
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_BUNDLE_COMPATIBLE", slotcnt, slot_state->bundle_compatible);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_BUNDLE_VERSION", slotcnt, slot_state->bundle_version);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_BUNDLE_DESCRIPTION", slotcnt, slot_state->bundle_description);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_BUNDLE_BUILD", slotcnt, slot_state->bundle_build);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_CHECKSUM_SHA256", slotcnt, slot_state->checksum.digest);
+			str = g_strdup_printf("%"G_GSIZE_FORMAT, slot_state->checksum.size);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_CHECKSUM_SIZE", slotcnt, str);
+			g_free(str);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_INSTALLED_TIMESTAMP", slotcnt, slot_state->installed_timestamp);
+			str = g_strdup_printf("%u", slot_state->installed_count);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_INSTALLED_COUNT", slotcnt, str);
+			g_free(str);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_ACTIVATED_TIMESTAMP", slotcnt, slot_state->activated_timestamp);
+			str = g_strdup_printf("%u", slot_state->activated_count);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_ACTIVATED_COUNT", slotcnt, str);
+			g_free(str);
+			formatter_shell_append_n(text, "RAUC_SLOT_STATUS_STATUS", slotcnt, slot_state->status);
+		}
 	}
 
 	return g_string_free(text, FALSE);
@@ -899,11 +1066,10 @@ static gchar* r_status_formatter_json(gboolean pretty)
 	JsonGenerator *gen;
 	JsonNode * root;
 	GHashTableIter iter;
-	gpointer key, value;
 	gchar *str;
-	JsonBuilder *builder = json_builder_new ();
+	JsonBuilder *builder = json_builder_new();
 	GError *ierror = NULL;
-	RaucSlot *primary = NULL;
+	RaucSlot *slot, *primary = NULL;
 
 	primary = r_boot_get_primary(&ierror);
 	if (!primary) {
@@ -911,26 +1077,26 @@ static gchar* r_status_formatter_json(gboolean pretty)
 		g_clear_error(&ierror);
 	}
 
-	json_builder_begin_object (builder);
+	json_builder_begin_object(builder);
 
-	json_builder_set_member_name (builder, "compatible");
-	json_builder_add_string_value (builder, r_context()->config->system_compatible);
+	json_builder_set_member_name(builder, "compatible");
+	json_builder_add_string_value(builder, r_context()->config->system_compatible);
 
-	json_builder_set_member_name (builder, "variant");
-	json_builder_add_string_value (builder, r_context()->config->system_variant);
+	json_builder_set_member_name(builder, "variant");
+	json_builder_add_string_value(builder, r_context()->config->system_variant);
 
-	json_builder_set_member_name (builder, "booted");
-	json_builder_add_string_value (builder, r_context()->bootslot);
+	json_builder_set_member_name(builder, "booted");
+	json_builder_add_string_value(builder, r_context()->bootslot);
 
-	json_builder_set_member_name (builder, "boot_primary");
-	json_builder_add_string_value (builder, primary ? primary->name : NULL);
+	json_builder_set_member_name(builder, "boot_primary");
+	json_builder_add_string_value(builder, primary ? primary->name : NULL);
 
-	json_builder_set_member_name (builder, "slots");
-	json_builder_begin_array (builder);
+	json_builder_set_member_name(builder, "slots");
+	json_builder_begin_array(builder);
 
 	g_hash_table_iter_init(&iter, r_context()->config->slots);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		RaucSlot *slot = value;
+	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
+		RaucSlotStatus *slot_state = slot->status;
 		gboolean good = FALSE;
 
 		if (slot->bootname && !r_boot_get_state(slot, &good, &ierror)) {
@@ -938,46 +1104,98 @@ static gchar* r_status_formatter_json(gboolean pretty)
 			g_clear_error(&ierror);
 		}
 
-		json_builder_begin_object (builder);
-		json_builder_set_member_name (builder, slot->name);
-		json_builder_begin_object (builder);
-		json_builder_set_member_name (builder, "class");
-		json_builder_add_string_value (builder, slot->sclass);
-		json_builder_set_member_name (builder, "device");
-		json_builder_add_string_value (builder, slot->device);
-		json_builder_set_member_name (builder, "type");
-		json_builder_add_string_value (builder, slot->type);
-		json_builder_set_member_name (builder, "bootname");
-		json_builder_add_string_value (builder, slot->bootname);
-		json_builder_set_member_name (builder, "state");
-		json_builder_add_string_value (builder, slotstate_to_str(slot->state));
-		json_builder_set_member_name (builder, "parent");
-		json_builder_add_string_value (builder, slot->parent ? slot->parent->name : NULL);
-		json_builder_set_member_name (builder, "mountpoint");
-		json_builder_add_string_value (builder, slot->mount_point);
-		json_builder_set_member_name (builder, "boot_status");
+		json_builder_begin_object(builder);
+		json_builder_set_member_name(builder, slot->name);
+		json_builder_begin_object(builder);
+		json_builder_set_member_name(builder, "class");
+		json_builder_add_string_value(builder, slot->sclass);
+		json_builder_set_member_name(builder, "device");
+		json_builder_add_string_value(builder, slot->device);
+		json_builder_set_member_name(builder, "type");
+		json_builder_add_string_value(builder, slot->type);
+		json_builder_set_member_name(builder, "bootname");
+		json_builder_add_string_value(builder, slot->bootname);
+		json_builder_set_member_name(builder, "state");
+		json_builder_add_string_value(builder, slotstate_to_str(slot->state));
+		json_builder_set_member_name(builder, "parent");
+		json_builder_add_string_value(builder, slot->parent ? slot->parent->name : NULL);
+		json_builder_set_member_name(builder, "mountpoint");
+		json_builder_add_string_value(builder, slot->mount_point);
+		json_builder_set_member_name(builder, "boot_status");
 		if (slot->bootname)
-			json_builder_add_string_value (builder, good ? "good" : "bad");
+			json_builder_add_string_value(builder, good ? "good" : "bad");
 		else
-			json_builder_add_string_value (builder, NULL);
-		json_builder_end_object (builder);
-		json_builder_end_object (builder);
-
+			json_builder_add_string_value(builder, NULL);
+		if (status_detailed && slot_state) {
+			json_builder_set_member_name(builder, "slot_status");
+			json_builder_begin_object(builder);     /* slot_status */
+			json_builder_set_member_name(builder, "bundle");
+			json_builder_begin_object(builder);             /* bundle */
+			json_builder_set_member_name(builder, "compatible");
+			json_builder_add_string_value(builder, slot_state->bundle_compatible);
+			if (slot_state->bundle_version) {
+				json_builder_set_member_name(builder, "version");
+				json_builder_add_string_value(builder, slot_state->bundle_version);
+			}
+			if (slot_state->bundle_description) {
+				json_builder_set_member_name(builder, "description");
+				json_builder_add_string_value(builder, slot_state->bundle_description);
+			}
+			if (slot_state->bundle_build) {
+				json_builder_set_member_name(builder, "build");
+				json_builder_add_string_value(builder, slot_state->bundle_build);
+			}
+			json_builder_end_object(builder);               /* bundle */
+			if (slot_state->checksum.digest && slot_state->checksum.type == G_CHECKSUM_SHA256) {
+				json_builder_set_member_name(builder, "checksum");
+				json_builder_begin_object(builder);     /* checksum */
+				json_builder_set_member_name(builder, "sha256");
+				json_builder_add_string_value(builder, slot_state->checksum.digest);
+				json_builder_set_member_name(builder, "size");
+				json_builder_add_int_value(builder, slot_state->checksum.size);
+				json_builder_end_object(builder);       /* checksum */
+			}
+			if (slot_state->installed_timestamp) {
+				json_builder_set_member_name(builder, "installed");
+				json_builder_begin_object(builder);     /* installed */
+				json_builder_set_member_name(builder, "timestamp");
+				json_builder_add_string_value(builder, slot_state->installed_timestamp);
+				json_builder_set_member_name(builder, "count");
+				json_builder_add_int_value(builder, slot_state->installed_count);
+				json_builder_end_object(builder);       /* installed */
+			}
+			if (slot_state->activated_timestamp) {
+				json_builder_set_member_name(builder, "activated");
+				json_builder_begin_object(builder);     /* activated */
+				json_builder_set_member_name(builder, "timestamp");
+				json_builder_add_string_value(builder, slot_state->activated_timestamp);
+				json_builder_set_member_name(builder, "count");
+				json_builder_add_int_value(builder, slot_state->activated_count);
+				json_builder_end_object(builder);       /* activated */
+			}
+			if (slot_state->status) {
+				json_builder_set_member_name(builder, "status");
+				json_builder_add_string_value(builder, slot_state->status);
+			}
+			json_builder_end_object(builder);       /* slot_status */
+		}
+		json_builder_end_object(builder);
+		json_builder_end_object(builder);
 	}
 
-	json_builder_end_array (builder);
+	json_builder_end_array(builder);
 
-	json_builder_end_object (builder);
+	json_builder_end_object(builder);
 
-	gen = json_generator_new ();
-	root = json_builder_get_root (builder);
-	json_generator_set_root (gen, root);
-	json_generator_set_pretty (gen, pretty);
-	str = json_generator_to_data (gen, NULL);
+	gen = json_generator_new();
+	root = json_builder_get_root(builder);
+	json_generator_set_root(gen, root);
+	json_generator_set_pretty(gen, pretty);
+	str = json_generator_to_data(gen, NULL);
 
-	json_node_free (root);
-	g_object_unref (gen);
-	g_object_unref (builder);
+	json_node_free(root);
+	g_object_unref(gen);
+	g_object_unref(builder);
 
 	return str;
 #else
@@ -986,10 +1204,90 @@ static gchar* r_status_formatter_json(gboolean pretty)
 #endif
 }
 
+static RaucSlotStatus* r_variant_get_slot_state(GVariant *vardict)
+{
+	RaucSlotStatus *slot_state = g_new0(RaucSlotStatus, 1);
+	GVariantDict dict;
+
+	g_variant_dict_init(&dict, vardict);
+
+	g_variant_dict_lookup(&dict, "bundle.compatible", "s", &slot_state->bundle_compatible);
+	g_variant_dict_lookup(&dict, "bundle.version", "s", &slot_state->bundle_version);
+	g_variant_dict_lookup(&dict, "bundle.description", "s", &slot_state->bundle_description);
+	g_variant_dict_lookup(&dict, "bundle.build", "s", &slot_state->bundle_build);
+	g_variant_dict_lookup(&dict, "status", "s", &slot_state->status);
+	if (g_variant_dict_lookup(&dict, "sha256", "s", &slot_state->checksum.digest))
+		slot_state->checksum.type = G_CHECKSUM_SHA256;
+	g_variant_dict_lookup(&dict, "size", "t", &slot_state->checksum.size);
+	g_variant_dict_lookup(&dict, "installed.timestamp", "s", &slot_state->installed_timestamp);
+	g_variant_dict_lookup(&dict, "installed.count", "u", &slot_state->installed_count);
+	g_variant_dict_lookup(&dict, "activated.timestamp", "s", &slot_state->activated_timestamp);
+	g_variant_dict_lookup(&dict, "activated.count", "u", &slot_state->activated_count);
+
+	vardict = g_variant_dict_end(&dict);
+	g_variant_unref(vardict);
+
+	return slot_state;
+}
+
+static gboolean retrieve_slot_states_via_dbus(GError **error)
+{
+	GBusType bus_type = (!g_strcmp0(g_getenv("DBUS_STARTER_BUS_TYPE"), "session"))
+	                    ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
+	GError *ierror = NULL;
+	RInstaller *proxy;
+	GVariant *slot_status_array, *vardict;
+	GHashTable *slots = r_context()->config->slots;
+	GVariantIter *iter;
+	gchar *slot_name;
+	RaucSlot *slot;
+
+	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
+
+	proxy = r_installer_proxy_new_for_bus_sync(bus_type,
+			G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+			"de.pengutronix.rauc", "/", NULL, &ierror);
+	if (proxy == NULL) {
+		g_set_error(error,
+				G_IO_ERROR,
+				G_IO_ERROR_FAILED,
+				"error creating proxy: %s", ierror->message);
+		g_error_free(ierror);
+		return FALSE;
+	}
+
+	g_debug("Trying to contact rauc service");
+	if (!r_installer_call_get_slot_status_sync(proxy, &slot_status_array, NULL, &ierror)) {
+		g_set_error(error,
+				G_IO_ERROR,
+				G_IO_ERROR_FAILED,
+				"error calling D-Bus method \"GetSlotStatus\": %s", ierror->message);
+		g_error_free(ierror);
+		return FALSE;
+	}
+
+	g_variant_get(slot_status_array, "a(sa{sv})", &iter);
+	while (g_variant_iter_loop(iter, "(s@a{sv})", &slot_name, &vardict)) {
+		slot = g_hash_table_lookup(slots, slot_name);
+		if (!slot) {
+			g_debug("No slot with name \"%s\" found", slot_name);
+			continue;
+		}
+
+		g_clear_pointer(&slot->status, free_slot_status);
+		slot->status = r_variant_get_slot_state(vardict);
+	}
+
+	g_variant_iter_free(iter);
+	g_variant_unref(slot_status_array);
+
+	return TRUE;
+}
+
 static gboolean status_start(int argc, char **argv)
 {
 	GBusType bus_type = (!g_strcmp0(g_getenv("DBUS_STARTER_BUS_TYPE"), "session"))
-		? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
+	                    ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
 	gchar *text = NULL;
 	gchar *slot_name = NULL;
 	gchar *message = NULL;
@@ -1008,6 +1306,23 @@ static gboolean status_start(int argc, char **argv)
 		g_clear_error(&ierror);
 		r_exit_status = 1;
 		goto out;
+	}
+
+	if (status_detailed) {
+		if (!ENABLE_SERVICE) {
+			GHashTableIter iter;
+			RaucSlot *slot;
+
+			g_hash_table_iter_init(&iter, r_context()->config->slots);
+			while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot))
+				load_slot_status(slot);
+		} else if (!retrieve_slot_states_via_dbus(&ierror)) {
+			message = g_strdup_printf("rauc status: error retrieving slot status via D-Bus: %s",
+					ierror->message);
+			g_error_free(ierror);
+			r_exit_status = 1;
+			goto out;
+		}
 	}
 
 	if (!output_format || g_strcmp0(output_format, "readable") == 0) {
@@ -1052,18 +1367,18 @@ static gboolean status_start(int argc, char **argv)
 
 	if (ENABLE_SERVICE) {
 		proxy = r_installer_proxy_new_for_bus_sync(bus_type,
-			G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
-			"de.pengutronix.rauc", "/", NULL, &ierror);
+				G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+				"de.pengutronix.rauc", "/", NULL, &ierror);
 		if (proxy == NULL) {
 			message = g_strdup_printf("rauc mark: error creating proxy: %s",
-						  ierror->message);
+					ierror->message);
 			g_error_free(ierror);
 			r_exit_status = 1;
 			goto out;
 		}
 		g_debug("Trying to contact rauc service");
 		if (!r_installer_call_mark_sync(proxy, state, slot_identifier,
-						&slot_name, &message, NULL, &ierror)) {
+				    &slot_name, &message, NULL, &ierror)) {
 			message = g_strdup(ierror->message);
 			g_error_free(ierror);
 			r_exit_status = 1;
@@ -1106,9 +1421,11 @@ typedef enum  {
 	BUNDLE,
 	RESIGN,
 	EXTRACT,
+	CONVERT,
 	CHECKSUM,
 	STATUS,
 	INFO,
+	WRITE_SLOT,
 	SERVICE,
 } RaucCommandType;
 
@@ -1117,7 +1434,7 @@ typedef struct {
 	const gchar* name;
 	const gchar* usage;
 	const gchar* summary;
-	gboolean (*cmd_handler) (int argc, char **argv);
+	gboolean (*cmd_handler)(int argc, char **argv);
 	GOptionGroup* options;
 	gboolean while_busy;
 } RaucCommand;
@@ -1135,6 +1452,7 @@ GOptionEntry entries_info[] = {
 };
 
 GOptionEntry entries_status[] = {
+	{"detailed", '\0', 0, G_OPTION_ARG_NONE, &status_detailed, "show more status details", NULL},
 	{"output-format", '\0', 0, G_OPTION_ARG_STRING, &output_format, "output format", "FORMAT"},
 	{0}
 };
@@ -1173,9 +1491,11 @@ static void cmdline_handler(int argc, char **argv)
 		{BUNDLE, "bundle", "bundle <INPUTDIR> <BUNDLENAME>", "Create a bundle from a content directory", bundle_start, NULL, FALSE},
 		{RESIGN, "resign", "resign <BUNDLENAME>", "Resign an already signed bundle", resign_start, NULL, FALSE},
 		{EXTRACT, "extract", "extract <BUNDLENAME> <OUTPUTDIR>", "Extract the bundle content", extract_start, NULL, FALSE},
+		{CONVERT, "convert", "convert <INBUNDLE> <OUTBUNDLE>", "Convert to casync index bundle and store", convert_start, NULL, FALSE},
 		{CHECKSUM, "checksum", "checksum <DIRECTORY>", "Deprecated", checksum_start, NULL, FALSE},
 		{INFO, "info", "info <FILE>", "Print bundle info", info_start, info_group, FALSE},
 		{STATUS, "status", "status", "Show system status", status_start, status_group, TRUE},
+		{WRITE_SLOT, "write-slot", "write-slot <SLOTNAME> <IMAGE>", "Write image to slot and bypass all update logic", write_slot_start, NULL, FALSE},
 #if ENABLE_SERVICE == 1
 		{SERVICE, "service", "service", "Start RAUC service", service_start, NULL, TRUE},
 #endif
@@ -1192,15 +1512,17 @@ static void cmdline_handler(int argc, char **argv)
 	g_option_context_set_help_enabled(context, FALSE);
 	g_option_context_set_ignore_unknown_options(context, TRUE);
 	g_option_context_add_main_entries(context, entries, NULL);
-	g_option_context_set_description(context, 
+	g_option_context_set_description(context,
 			"List of rauc commands:\n" \
 			"  bundle\tCreate a bundle\n" \
 			"  resign\tResign an already signed bundle\n" \
 			"  extract\tExtract the bundle content\n" \
+			"  convert\tConvert classic to casync bundle\n" \
 			"  checksum\tUpdate a manifest with checksums (and optionally sign it)\n" \
 			"  install\tInstall a bundle\n" \
 			"  info\t\tShow file information\n" \
-			"  status\tShow status");
+			"  status\tShow status\n" \
+			"  write-slot\tWrite image to slot and bypass all update logic");
 
 	if (!g_option_context_parse(context, &argc, &argv, &error)) {
 		g_printerr("%s\n", error->message);
@@ -1224,7 +1546,7 @@ static void cmdline_handler(int argc, char **argv)
 
 	/* get first parameter wihtout dashes */
 	for (gint i = 1; i <= argc; i++) {
-		if (argv[i] && !g_str_has_prefix (argv[i], "-")) {
+		if (argv[i] && !g_str_has_prefix(argv[i], "-")) {
 			cmdarg = argv[i];
 			break;
 		}
@@ -1232,7 +1554,7 @@ static void cmdline_handler(int argc, char **argv)
 
 	if (cmdarg == NULL) {
 		if (version) {
-			g_print(PACKAGE_STRING"\n");
+			g_print(PACKAGE_STRING "\n");
 			goto done;
 		}
 
@@ -1335,7 +1657,8 @@ done:
 	g_clear_pointer(&context, g_option_context_free);;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
 	/* disable remote VFS */
 	g_assert(g_setenv("GIO_USE_VFS", "local", TRUE));
 

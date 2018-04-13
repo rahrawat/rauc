@@ -78,12 +78,14 @@ The ``status`` command allows this:
 
 .. code-block:: sh
 
-  rauc status [--output-format=<format>]
+  rauc status [--detailed] [--output-format=<format>]
 
 You can choose the output style of RAUC status depending on your needs.
-By default it will print a human readable representation of your system.
-Alternatively you can obtain a shell-parsable description, or a JSON
-representation of the system status.
+By default it will print a human readable representation of your system's most
+important properties. Alternatively you can obtain a shell-parsable description,
+or a JSON representation of the system status.
+If more information is needed such as the slots' :ref:`status <slot-status>` add
+the command line option ``--detailed``.
 
 React to a Successfully Booted System/Failed Boot
 -------------------------------------------------
@@ -156,6 +158,9 @@ do so by using its slot name which has the form ``<slot-class>.<idx>`` (e.g.
 after switching to a different slot by mistake, before having rebooted this can
 be remedied by choosing ``booted`` as the argument which is, by the way, the
 default if the optional argument has been omitted.
+The date and time of activation as well as the number of activations is part of
+the slot's metadata which is stored in the slot status file, see section
+:ref:`slot-status`.
 
 Customizing the Update
 ----------------------
@@ -223,7 +228,7 @@ will abort installation with an error.
   [handlers]
   post-install=/usr/lib/rauc/post-install
 
-The post install handler will be called right after RAUC successfully performed
+The post-install handler will be called right after RAUC successfully performed
 a system update. If any error occurred during installation, the post-install
 handler will not be called.
 
@@ -275,6 +280,8 @@ In the following the available hooks are listed. Depending on their purpose,
 some are image-specific, i.e. they will be executed for the installation of a
 specific image only, while some other are global.
 
+.. _sec-install-hooks:
+
 Install Hooks
 ^^^^^^^^^^^^^
 
@@ -321,7 +328,7 @@ the hook executable as the rejection reason message and provide it to the user:
   case "$1" in
           install-check)
                   if [[ "$RAUC_MF_COMPATIBLE" != "$RAUC_SYSTEM_COMPATIBLE" ]]; then
-                          echo "Comptaible does not match!" 1>&2
+                          echo "Compatible does not match!" 1>&2
                           exit 10
                   fi
                   ;;
@@ -331,6 +338,8 @@ the hook executable as the rejection reason message and provide it to the user:
   esac
 
   exit 0
+
+.. _sec-slot-hooks:
 
 Slot Hooks
 ^^^^^^^^^^
