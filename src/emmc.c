@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <glib/gstdio.h>
 #include <linux/major.h>
+#include <linux/types.h> /* kernel < 3.4 forgot that in mmc/ioctl.h */
 #include <linux/mmc/ioctl.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -91,7 +92,7 @@ gboolean r_emmc_write_bootpart(const gchar *device, gint bootpart_active, GError
 
 	g_return_val_if_fail(bootpart_active == 0 || bootpart_active == 1, FALSE);
 
-	fd = g_open(device, O_RDWR);
+	fd = g_open(device, O_RDWR | O_EXCL);
 	if (fd == -1) {
 		g_set_error(error, R_UPDATE_ERROR, R_UPDATE_ERROR_FAILED,
 				"opening eMMC device failed: %s", g_strerror(errno));
