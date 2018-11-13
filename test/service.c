@@ -127,6 +127,9 @@ static void service_test_install(ServiceFixture *fixture, gconstpointer user_dat
 	GQueue *args = g_queue_new();
 	const gchar *operation = NULL, *last_error = NULL;
 	GVariant *progress = NULL;
+	const gchar *compatible = NULL;
+	const gchar *variant = NULL;
+	const gchar *bootslot = NULL;
 	gchar *bundlepath;
 	GError *error = NULL;
 	gboolean ret = FALSE;
@@ -157,12 +160,12 @@ static void service_test_install(ServiceFixture *fixture, gconstpointer user_dat
 	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  80, "Updating slots", 2));
 	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  80, "Checking slot rootfs.1", 3));
 	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  85, "Checking slot rootfs.1 done.", 3));
-	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  85, "Copying image", 3));
-	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  90, "Copying image done.", 3));
+	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  85, "Copying image to rootfs.1", 3));
+	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  90, "Copying image to rootfs.1 done.", 3));
 	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  90, "Checking slot appfs.1", 3));
 	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  95, "Checking slot appfs.1 done.", 3));
-	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  95, "Copying image", 3));
-	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)", 100, "Copying image done.", 3));
+	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)",  95, "Copying image to appfs.1", 3));
+	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)", 100, "Copying image to appfs.1 done.", 3));
 	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)", 100, "Updating slots done.", 2));
 	g_queue_push_tail(args, (gpointer*)g_variant_new("(isi)", 100, "Installing done.", 1));
 
@@ -186,6 +189,13 @@ static void service_test_install(ServiceFixture *fixture, gconstpointer user_dat
 
 	progress = r_installer_get_progress(installer);
 	assert_progress(progress, 0, "", 0);
+
+	compatible = r_installer_get_compatible(installer);
+	g_assert_cmpstr(compatible, ==, "Test Config");
+	variant = r_installer_get_variant(installer);
+	g_assert_cmpstr(variant, ==, "Default Variant");
+	bootslot = r_installer_get_boot_slot(installer);
+	g_assert_cmpstr(bootslot, ==, "system0");
 
 	r_context();
 

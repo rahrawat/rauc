@@ -785,6 +785,67 @@ device=/dev/null\n\
 	g_hash_table_unref(tgrp);
 }
 
+static void test_install_image_readonly(void)
+{
+	gchar *tmpdir = NULL;
+	gchar* sysconfpath = NULL;
+	GBytes *data = NULL;
+	RaucManifest *rm = NULL;
+	GHashTable *tgrp = NULL;
+	GError *error = NULL;
+	GList *selected_images = NULL;
+
+#define MANIFEST "\
+[update]\n\
+compatible=foo\n\
+\n\
+[image.rescuefs]\n\
+filename=rootfs.img\n\
+"
+
+	const gchar *system_conf = "\
+[system]\n\
+compatible=foo\n\
+bootloader=barebox\n\
+\n\
+[slot.rootfs.0]\n\
+bootname=system0\n\
+device=/dev/null\n\
+\n\
+[slot.rescuefs.0]\n\
+device=/dev/null\n\
+readonly=true\n\
+";
+	tmpdir = g_dir_make_tmp("rauc-XXXXXX", NULL);
+
+	sysconfpath = write_tmp_file(tmpdir, "test.conf", system_conf, NULL);
+	g_assert_nonnull(sysconfpath);
+
+	/* Set up context */
+	r_context_conf()->configpath = sysconfpath;
+	r_context_conf()->bootslot = g_strdup("system0");
+	r_context();
+
+	data = g_bytes_new_static(MANIFEST, sizeof(MANIFEST));
+	load_manifest_mem(data, &rm, &error);
+	g_assert_no_error(error);
+
+	determine_slot_states(&error);
+	g_assert_no_error(error);
+
+	tgrp = determine_target_install_group();
+	g_assert_nonnull(tgrp);
+
+	/* we expect the image mapping to fail as there is an image for a
+	 * readonly slot */
+	selected_images = get_install_images(rm, tgrp, &error);
+	g_assert_null(selected_images);
+	g_assert_error(error, R_INSTALL_ERROR, R_INSTALL_ERROR_FAILED);
+
+	g_hash_table_unref(tgrp);
+}
+
+
 static void test_install_image_variants(void)
 {
 	gchar *tmpdir = NULL;
@@ -997,16 +1058,19 @@ static void install_test_network(InstallFixture *fixture,
 	r_context_conf()->mountprefix = mountdir;
 	r_context();
 
+	g_test_expect_message(G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, "Network mode is marked as deprecated!\nPlease contact RAUC maintainers if you see this message and intend to use the network mode in future RAUC versions!");
 	manifesturl = g_strconcat("file://", fixture->tmpdir,
 			"/content/manifest-1.raucm", NULL);
 	g_assert_true(do_install_network(manifesturl, NULL));
 	g_free(manifesturl);
 
+	g_test_expect_message(G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, "Network mode is marked as deprecated!\nPlease contact RAUC maintainers if you see this message and intend to use the network mode in future RAUC versions!");
 	manifesturl = g_strconcat("file://", fixture->tmpdir,
 			"/content/manifest-2.raucm", NULL);
 	g_assert_true(do_install_network(manifesturl, NULL));
 	g_free(manifesturl);
 
+	g_test_expect_message(G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, "Network mode is marked as deprecated!\nPlease contact RAUC maintainers if you see this message and intend to use the network mode in future RAUC versions!");
 	manifesturl = g_strconcat("file://", fixture->tmpdir,
 			"/content/manifest-3.raucm", NULL);
 	g_assert_true(do_install_network(manifesturl, NULL));
@@ -1067,11 +1131,14 @@ static void install_test_network_thread(InstallFixture *fixture,
 
 	manifesturl = g_strconcat("file://", fixture->tmpdir,
 			"/content/manifest-1.raucm", NULL);
+	g_test_expect_message(G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, "Network mode is marked as deprecated!\nPlease contact RAUC maintainers if you see this message and intend to use the network mode in future RAUC versions!");
 	g_assert_true(do_install_network(manifesturl, NULL));
 	args->name = g_strdup(manifesturl);
 	args->notify = install_notify;
 	args->cleanup = install_cleanup;
 
+	g_test_expect_message(G_LOG_DOMAIN, G_LOG_LEVEL_MESSAGE, "Active slot bootname: system0");
+	g_test_expect_message(G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, "Network mode is marked as deprecated!\nPlease contact RAUC maintainers if you see this message and intend to use the network mode in future RAUC versions!");
 	r_loop = g_main_loop_new(NULL, FALSE);
 	g_assert_true(install_run(args));
 	g_main_loop_run(r_loop);
@@ -1104,7 +1171,7 @@ static void install_test_bundle_hook_install_check(InstallFixture *fixture,
 	args->notify = install_notify;
 	args->cleanup = install_cleanup;
 	g_assert_false(do_install_bundle(args, &ierror));
-	g_assert_cmpstr(ierror->message, ==, "Handler error: Bundle rejected: Hook returned: No, I won't install this!");
+	g_assert_cmpstr(ierror->message, ==, "Installation error: Bundle rejected: Hook returned: No, I won't install this!");
 
 	args->status_result = 0;
 
@@ -1254,6 +1321,8 @@ int main(int argc, char *argv[])
 	g_test_add_func("/install/image-selection/redundant", test_install_image_selection);
 
 	g_test_add_func("/install/image-selection/non-matching", test_install_image_selection_no_matching_slot);
+
+	g_test_add_func("/install/image-selection/readonly", test_install_image_readonly);
 
 	g_test_add_func("/install/image-mapping/variants", test_install_image_variants);
 

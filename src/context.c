@@ -8,11 +8,24 @@
 
 RaucContext *context = NULL;
 
+static const gchar *regex_match(const gchar *pattern, const gchar *string)
+{
+	g_autoptr(GRegex) regex = NULL;
+	g_autoptr(GMatchInfo) match = NULL;
+
+	g_return_val_if_fail(pattern, NULL);
+	g_return_val_if_fail(string, NULL);
+
+	regex = g_regex_new(pattern, 0, 0, NULL);
+	if (g_regex_match(regex, string, 0, &match))
+		return g_match_info_fetch(match, 1);
+
+	return NULL;
+}
+
 static const gchar* get_cmdline_bootname(void)
 {
-	GRegex *regex = NULL;
-	GMatchInfo *match = NULL;
-	char *contents = NULL;
+	g_autofree gchar *contents = NULL;
 	static const char *bootname = NULL;
 	gchar buf[PATH_MAX + 1];
 	gchar *realdev = NULL;
@@ -23,30 +36,23 @@ static const gchar* get_cmdline_bootname(void)
 	if (!g_file_get_contents("/proc/cmdline", &contents, NULL, NULL))
 		return NULL;
 
-	regex = g_regex_new("rauc\\.slot=(\\S+)", 0, 0, NULL);
-	if (g_regex_match(regex, contents, 0, &match)) {
-		bootname = g_match_info_fetch(match, 1);
-		goto out;
-	}
-	g_clear_pointer(&match, g_match_info_free);
-	g_clear_pointer(&regex, g_regex_unref);
+	bootname = regex_match("rauc\\.slot=(\\S+)", contents);
+	if (bootname)
+		return bootname;
 
 	/* For barebox, we check if the bootstate code set the active slot name
 	 * in the command line */
 	if (g_strcmp0(context->config->system_bootloader, "barebox") == 0) {
-		regex = g_regex_new("(?:bootstate|bootchooser)\\.active=(\\S+)", 0, 0, NULL);
-		if (g_regex_match(regex, contents, 0, &match)) {
-			bootname = g_match_info_fetch(match, 1);
-			goto out;
-		}
-		g_clear_pointer(&match, g_match_info_free);
-		g_clear_pointer(&regex, g_regex_unref);
+		bootname = regex_match(
+				"(?:bootstate|bootchooser)\\.active=(\\S+)",
+				contents);
+		if (bootname)
+			return bootname;
 	}
 
-	regex = g_regex_new("root=(\\S+)", 0, 0, NULL);
-	if (g_regex_match(regex, contents, 0, &match)) {
-		bootname = g_match_info_fetch(match, 1);
-	}
+	bootname = regex_match("root=(\\S+)", contents);
+	if (!bootname)
+		return NULL;
 
 	if (strncmp(bootname, "PARTUUID=", 9) == 0) {
 		gchar *partuuidpath = g_build_filename(
@@ -73,7 +79,7 @@ static const gchar* get_cmdline_bootname(void)
 	realdev = realpath(bootname, buf);
 	if (realdev == NULL) {
 		g_message("Failed to resolve realpath for '%s'", bootname);
-		goto out;
+		return bootname;
 	}
 
 	if (g_strcmp0(realdev, bootname) != 0) {
@@ -83,27 +89,24 @@ static const gchar* get_cmdline_bootname(void)
 		bootname = g_strdup(realdev);
 	}
 
-
-out:
-	g_clear_pointer(&match, g_match_info_free);
-	g_clear_pointer(&regex, g_regex_unref);
-	g_clear_pointer(&contents, g_free);
-
 	return bootname;
 }
 
 static gboolean launch_and_wait_variables_handler(gchar *handler_name, GHashTable *variables, GError **error)
 {
-	GSubprocessLauncher *handlelaunch = NULL;
-	GSubprocess *handleproc = NULL;
+	g_autoptr(GSubprocessLauncher) handlelaunch = NULL;
+	g_autoptr(GSubprocess) handleproc = NULL;
 	GError *ierror = NULL;
-	gboolean res = FALSE;
 	GHashTableIter iter;
 	gchar *key = NULL;
 	gchar *value = NULL;
-	GDataInputStream *datainstream = NULL;
+	g_autoptr(GDataInputStream) datainstream = NULL;
 	GInputStream *instream;
 	gchar* outline;
+
+	g_return_val_if_fail(handler_name, FALSE);
+	g_return_val_if_fail(variables, FALSE);
+	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	handlelaunch = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_MERGE);
 
@@ -122,7 +125,7 @@ static gboolean launch_and_wait_variables_handler(gchar *handler_name, GHashTabl
 
 	if (!handleproc) {
 		g_propagate_error(error, ierror);
-		goto out;
+		return FALSE;
 	}
 
 	instream = g_subprocess_get_stdout_pipe(handleproc);
@@ -144,24 +147,20 @@ static gboolean launch_and_wait_variables_handler(gchar *handler_name, GHashTabl
 		}
 	} while (outline);
 
-	res = g_subprocess_wait_check(handleproc, NULL, &ierror);
-	if (!res) {
+	if (!g_subprocess_wait_check(handleproc, NULL, &ierror)) {
 		g_propagate_error(error, ierror);
-		goto out;
+		return FALSE;
 	}
 
-	res = TRUE;
-out:
-	g_clear_object(&datainstream);
-	g_clear_object(&handleproc);
-	g_clear_object(&handlelaunch);
-	return res;
+	return TRUE;
 }
 
 static gchar* get_system_dtb_compatible(GError **error)
 {
 	gchar *contents = NULL;
 	GError *ierror = NULL;
+
+	g_return_val_if_fail(error == NULL || *error == NULL, NULL);
 
 	if (!g_file_get_contents("/sys/firmware/devicetree/base/compatible", &contents, NULL, &ierror)) {
 		g_propagate_error(error, ierror);
@@ -175,6 +174,9 @@ static gchar* get_variant_from_file(const gchar* filename, GError **error)
 {
 	gchar *contents = NULL;
 	GError *ierror = NULL;
+
+	g_return_val_if_fail(filename, NULL);
+	g_return_val_if_fail(error == NULL || *error == NULL, NULL);
 
 	if (!g_file_get_contents(filename, &contents, NULL, &ierror)) {
 		g_propagate_error(error, ierror);
@@ -229,7 +231,7 @@ static void r_context_configure(void)
 	    g_file_test(context->config->systeminfo_handler, G_FILE_TEST_EXISTS)) {
 
 		GError *ierror = NULL;
-		GHashTable *vars = NULL;
+		g_autoptr(GHashTable) vars = NULL;
 		GHashTableIter iter;
 		gchar *key = NULL;
 		gchar *value = NULL;
@@ -239,7 +241,7 @@ static void r_context_configure(void)
 		g_message("Getting Systeminfo: %s", context->config->systeminfo_handler);
 		res = launch_and_wait_variables_handler(context->config->systeminfo_handler, vars, &ierror);
 		if (!res) {
-			g_error("Failed to read system-info variables%s", ierror->message);
+			g_error("Failed to read system-info variables: %s", ierror->message);
 			g_clear_error(&ierror);
 		}
 
@@ -248,8 +250,6 @@ static void r_context_configure(void)
 			if (g_strcmp0(key, "RAUC_SYSTEM_SERIAL") == 0)
 				r_context_conf()->system_serial = g_strdup(value);
 		}
-
-		g_clear_pointer(&vars, g_hash_table_unref);
 	}
 
 	if (context->bootslot == NULL) {
@@ -338,9 +338,12 @@ void r_context_begin_step(const gchar *name, const gchar *description,
 	RaucProgressStep *step = g_new0(RaucProgressStep, 1);
 	RaucProgressStep *parent;
 
+	g_return_if_fail(name);
+	g_return_if_fail(description);
+
 	/* set properties */
-	step->name = name;
-	step->description = description;
+	step->name = g_strdup(name);
+	step->description = g_strdup(description);
 	step->substeps_total = substeps;
 	step->substeps_done = 0;
 	step->percent_done = 0;
@@ -375,11 +378,28 @@ void r_context_begin_step(const gchar *name, const gchar *description,
 	r_context_send_progress(FALSE, FALSE);
 }
 
+void r_context_begin_step_formatted(const gchar *name, gint substeps, const gchar *description, ...)
+{
+	va_list args;
+	g_autofree gchar *desc_formatted = NULL;
+
+	g_return_if_fail(name);
+	g_return_if_fail(description);
+
+	va_start(args, description);
+	desc_formatted = g_strdup_vprintf(description, args);
+	va_end(args);
+
+	r_context_begin_step(name, desc_formatted, substeps);
+}
+
 void r_context_end_step(const gchar *name, gboolean success)
 {
 	RaucProgressStep *step;
 	GList *step_element;
 	RaucProgressStep *parent;
+
+	g_return_if_fail(name);
 
 	/* "stack" should never be NULL at this point */
 	g_assert_nonnull(context->progress);
@@ -430,7 +450,7 @@ void r_context_end_step(const gchar *name, gboolean success)
 			step_element);
 
 	g_list_free(step_element);
-	g_free(step);
+	r_context_free_progress_step(step);
 }
 
 void r_context_set_step_percentage(const gchar *name, gint custom_percent)
@@ -438,6 +458,8 @@ void r_context_set_step_percentage(const gchar *name, gint custom_percent)
 	RaucProgressStep *step;
 	RaucProgressStep *parent;
 	gint percent_difference;
+
+	g_return_if_fail(name);
 
 	g_assert_nonnull(context->progress);
 
@@ -467,9 +489,19 @@ void r_context_set_step_percentage(const gchar *name, gint custom_percent)
 		r_context_send_progress(FALSE, FALSE);
 }
 
+void r_context_free_progress_step(RaucProgressStep *step)
+{
+	g_return_if_fail(step);
+
+	g_free(step->name);
+	g_free(step->description);
+	g_free(step);
+}
+
 void r_context_register_progress_callback(progress_callback progress_cb)
 {
-	g_assert_nonnull(progress_cb);
+	g_return_if_fail(progress_cb);
+
 	g_assert_null(context->progress_callback);
 
 	context->progress_callback = progress_cb;
@@ -478,8 +510,18 @@ void r_context_register_progress_callback(progress_callback progress_cb)
 RaucContext *r_context_conf(void)
 {
 	if (context == NULL) {
-		network_init();
-		signature_init();
+		GError *ierror = NULL;
+
+		if (!network_init(&ierror)) {
+			g_warning("%s", ierror->message);
+			g_error_free(ierror);
+			return NULL;
+		}
+		if (!signature_init(&ierror)) {
+			g_warning("%s", ierror->message);
+			g_error_free(ierror);
+			return NULL;
+		}
 
 		context = g_new0(RaucContext, 1);
 		context->configpath = g_strdup("/etc/rauc/system.conf");

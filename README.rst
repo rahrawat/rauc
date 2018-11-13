@@ -12,9 +12,9 @@ RAUC - Robust Auto-Update Controller
 .. image:: https://img.shields.io/travis/rauc/rauc/master.svg
    :alt: Travis branch
    :target: https://travis-ci.org/rauc/rauc
-.. image:: https://img.shields.io/coveralls/rauc/rauc/master.svg
-   :alt: Coveralls branch
-   :target: https://coveralls.io/r/rauc/rauc
+.. image:: https://codecov.io/gh/rauc/rauc/branch/master/graph/badge.svg
+   :alt: Codecov.io branch
+   :target: https://codecov.io/gh/rauc/rauc
 .. image:: https://img.shields.io/coverity/scan/5085.svg
    :alt: Coverity
    :target: https://scan.coverity.com/projects/5085
@@ -46,6 +46,8 @@ Features
   * Update compatibility check
 * **Cryptographic signing and verification** of updates using OpenSSL (signatures
   based on x.509 certificates)
+
+  * Keys and certificates on **PKCS#11 tokens** (HSMs) are supported
 * **Flexible and customizable** redundancy/storage setup
 
   * **Symmetric** setup (Root-FS A & B)
@@ -139,8 +141,9 @@ Host (Build) Prerequisites
 -  libcurl3-dev
 -  libssl-dev
 
-   sudo apt-get install automake libtool libglib2.0-dev libcurl3-dev
-   libssl-dev libjson-glib-dev
+::
+
+   sudo apt-get install automake libtool libglib2.0-dev libcurl3-dev libssl-dev
 
 If you intend to use json-support you also need
 
@@ -160,6 +163,13 @@ For using tar archive in RAUC bundles with Busybox tar, you have to enable the
 following Busybox feature:
 
 -  ``CONFIG_FEATURE_TAR_AUTODETECT=y``
+-  ``CONFIG_FEATURE_TAR_LONG_OPTIONS=y``
+
+Depending on the actual storage type and/or filesystem used, further target
+tools might be required.
+The documentation chapter
+`Required Target Tools <http://rauc.readthedocs.io/en/latest/integration.html#required-target-tools>`_
+gives a more detailed list on these.
 
 Building from Sources
 ---------------------

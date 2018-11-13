@@ -1,26 +1,137 @@
+#include <openssl/asn1.h>
 #include <openssl/cms.h>
 #include <openssl/conf.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/crypto.h>
+#include <openssl/engine.h>
+#include <openssl/x509.h>
 
 #include "context.h"
 #include "signature.h"
+
+/* Define for OpenSSL 1.0.x backwards compatiblity.
+ * We use newer get0 names to be clear about memory ownership and to not use
+ * API deprecated in OpenSSL 1.1.x */
+#if (OPENSSL_VERSION_NUMBER < 0x10100000L)
+#define X509_get0_notAfter X509_get_notAfter
+#define X509_get0_notBefore X509_get_notBefore
+#endif
 
 GQuark r_signature_error_quark(void)
 {
 	return g_quark_from_static_string("r_signature_error_quark");
 }
 
-void signature_init(void)
+gboolean signature_init(GError **error)
 {
-	OPENSSL_no_config();
+#if (OPENSSL_VERSION_NUMBER < 0x10100000L)
+	OPENSSL_config(NULL);
 	OpenSSL_add_all_algorithms();
 	ERR_load_crypto_strings();
+#else
+	int ret;
+
+	g_return_val_if_fail(error == FALSE || *error == NULL, FALSE);
+
+	ret = OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+	if (!ret) {
+		unsigned long err;
+		const gchar *data;
+		int flags;
+
+		err = ERR_get_error_line_data(NULL, NULL, &data, &flags);
+		g_set_error(
+				error,
+				R_SIGNATURE_ERROR,
+				R_SIGNATURE_ERROR_CRYPTOINIT_FAILED,
+				"Failed to initalize OpenSSL crypto: %s",
+				(flags & ERR_TXT_STRING) ? data : ERR_error_string(err, NULL));
+		return FALSE;
+	}
+#endif
+
+	return TRUE;
 }
 
-static EVP_PKEY *load_key(const gchar *keyfile, GError **error)
+static ENGINE *get_pkcs11_engine(GError **error)
+{
+	static ENGINE *e = NULL;
+	unsigned long err;
+	const gchar *data;
+	const gchar *env;
+	int flags;
+
+	g_return_val_if_fail(error == NULL || *error == NULL, NULL);
+
+	ENGINE_load_builtin_engines();
+
+	e = ENGINE_by_id("pkcs11");
+	if (e == NULL) {
+		err = ERR_get_error_line_data(NULL, NULL, &data, &flags);
+		g_set_error(
+				error,
+				R_SIGNATURE_ERROR,
+				R_SIGNATURE_ERROR_LOAD_FAILED,
+				"failed to load PKCS11 engine: %s",
+				(flags & ERR_TXT_STRING) ? data : ERR_error_string(err, NULL));
+
+		goto out;
+	}
+
+	env = g_getenv("RAUC_PKCS11_MODULE");
+	if (env != NULL) {
+		if (!ENGINE_ctrl_cmd_string(e, "MODULE_PATH", env, 0)) {
+			err = ERR_get_error_line_data(NULL, NULL, &data, &flags);
+			g_set_error(
+					error,
+					R_SIGNATURE_ERROR,
+					R_SIGNATURE_ERROR_PARSE_ERROR,
+					"failed to configure PKCS11 module path: %s",
+					(flags & ERR_TXT_STRING) ? data : ERR_error_string(err, NULL));
+			goto free;
+		}
+	}
+
+	if (ENGINE_init(e) == 0) {
+		err = ERR_get_error_line_data(NULL, NULL, &data, &flags);
+		g_set_error(
+				error,
+				R_SIGNATURE_ERROR,
+				R_SIGNATURE_ERROR_LOAD_FAILED,
+				"failed to initialize PKCS11 engine: %s",
+				(flags & ERR_TXT_STRING) ? data : ERR_error_string(err, NULL));
+
+		goto free;
+	}
+
+	env = g_getenv("RAUC_PKCS11_PIN");
+	if (env != NULL) {
+		if (!ENGINE_ctrl_cmd_string(e, "PIN", env, 0)) {
+			err = ERR_get_error_line_data(NULL, NULL, &data, &flags);
+			g_set_error(
+					error,
+					R_SIGNATURE_ERROR,
+					R_SIGNATURE_ERROR_PARSE_ERROR,
+					"failed to configure PKCS11 PIN: %s",
+					(flags & ERR_TXT_STRING) ? data : ERR_error_string(err, NULL));
+			goto finish;
+		}
+	}
+
+	goto out;
+
+finish:
+	ENGINE_finish(e);
+free:
+	ENGINE_free(e);
+	e = NULL;
+out:
+	return e;
+}
+
+static EVP_PKEY *load_key_file(const gchar *keyfile, GError **error)
 {
 	EVP_PKEY *res = NULL;
 	BIO *key = NULL;
@@ -57,7 +168,50 @@ out:
 	return res;
 }
 
-static X509 *load_cert(const gchar *certfile, GError **error)
+static EVP_PKEY *load_key_pkcs11(const gchar *url, GError **error)
+{
+	EVP_PKEY *res = NULL;
+	unsigned long err;
+	const gchar *data;
+	GError *ierror = NULL;
+	int flags;
+	ENGINE *e;
+
+	g_return_val_if_fail(url != NULL, NULL);
+	g_return_val_if_fail(error == NULL || *error == NULL, NULL);
+
+	e = get_pkcs11_engine(&ierror);
+	if (e == NULL) {
+		g_propagate_error(error, ierror);
+		goto out;
+	}
+
+	res = ENGINE_load_private_key(e, url, NULL, NULL);
+	if (res == NULL) {
+		err = ERR_get_error_line_data(NULL, NULL, &data, &flags);
+		g_set_error(
+				error,
+				R_SIGNATURE_ERROR,
+				R_SIGNATURE_ERROR_LOAD_FAILED,
+				"failed to load PKCS11 private key for '%s': %s", url,
+				(flags & ERR_TXT_STRING) ? data : ERR_error_string(err, NULL));
+		goto out;
+	}
+out:
+	return res;
+}
+
+static EVP_PKEY *load_key(const gchar *name, GError **error)
+{
+	g_return_val_if_fail(name != NULL, NULL);
+
+	if (g_str_has_prefix(name, "pkcs11:"))
+		return load_key_pkcs11(name, error);
+	else
+		return load_key_file(name, error);
+}
+
+static X509 *load_cert_file(const gchar *certfile, GError **error)
 {
 	X509 *res = NULL;
 	BIO *cert = NULL;
@@ -65,6 +219,7 @@ static X509 *load_cert(const gchar *certfile, GError **error)
 	const gchar *data;
 	int flags;
 
+	g_return_val_if_fail(certfile != NULL, NULL);
 	g_return_val_if_fail(error == NULL || *error == NULL, NULL);
 
 	cert = BIO_new_file(certfile, "r");
@@ -92,6 +247,58 @@ static X509 *load_cert(const gchar *certfile, GError **error)
 out:
 	BIO_free_all(cert);
 	return res;
+}
+
+static X509 *load_cert_pkcs11(const gchar *url, GError **error)
+{
+	X509 *res = NULL;
+	unsigned long err;
+	const gchar *data;
+	GError *ierror = NULL;
+	int flags;
+	ENGINE *e;
+
+	/* this is defined in libp11 src/eng_back.c ctx_ctrl_load_cert() */
+	struct {
+		const char *url;
+		X509 *cert;
+	} parms;
+
+	g_return_val_if_fail(url != NULL, NULL);
+	g_return_val_if_fail(error == NULL || *error == NULL, NULL);
+
+	e = get_pkcs11_engine(&ierror);
+	if (e == NULL) {
+		g_propagate_error(error, ierror);
+		goto out;
+	}
+
+	parms.url = url;
+	parms.cert = NULL;
+	if (!ENGINE_ctrl_cmd(e, "LOAD_CERT_CTRL", 0, &parms, NULL, 0) || (parms.cert == NULL)) {
+		err = ERR_get_error_line_data(NULL, NULL, &data, &flags);
+		g_set_error(
+				error,
+				R_SIGNATURE_ERROR,
+				R_SIGNATURE_ERROR_PARSE_ERROR,
+				"failed to load PKCS11 certificate for '%s': %s", url,
+				(flags & ERR_TXT_STRING) ? data : ERR_error_string(err, NULL));
+		goto out;
+	}
+	res = parms.cert;
+
+out:
+	return res;
+}
+
+static X509 *load_cert(const gchar *name, GError **error)
+{
+	g_return_val_if_fail(name != NULL, NULL);
+
+	if (g_str_has_prefix(name, "pkcs11:"))
+		return load_cert_pkcs11(name, error);
+	else
+		return load_cert_file(name, error);
 }
 
 static GBytes *bytes_from_bio(BIO *bio)
@@ -180,6 +387,54 @@ GBytes *cms_sign(GBytes *content, const gchar *certfile, const gchar *keyfile, g
 				"Read zero bytes");
 		goto out;
 	}
+
+	/* keyring was given, perform verification to obtain trust chain */
+	if (r_context()->config->keyring_path) {
+		g_autoptr(CMS_ContentInfo) vcms = NULL;
+		g_autoptr(X509_STORE) store = NULL;
+		STACK_OF(X509) *verified_chain = NULL;
+
+		g_message("Keyring given, doing signature verification");
+		if (!cms_verify(content, res, &vcms, &store, &ierror)) {
+			g_propagate_error(error, ierror);
+			res = NULL;
+			goto out;
+		}
+
+		if (!cms_get_cert_chain(vcms, store, &verified_chain, &ierror)) {
+			g_propagate_error(error, ierror);
+			res = NULL;
+			goto out;
+		}
+
+		for (int i = 0; i < sk_X509_num(verified_chain); i++) {
+			const ASN1_TIME *expiry_time;
+			struct tm *next_month;
+			time_t now;
+			time_t comp;
+			time(&now);
+
+			next_month = gmtime(&now);
+			next_month->tm_mon += 1;
+			if (next_month->tm_mon == 12)
+				next_month->tm_mon = 0;
+			comp = timegm(next_month);
+
+			expiry_time = X509_get0_notAfter(sk_X509_value(verified_chain, i));
+
+			/* Check if expiry time is within last month */
+			if (X509_cmp_current_time(expiry_time) == 1 && X509_cmp_time(expiry_time, &comp) == -1) {
+				char buf[BUFSIZ];
+				X509_NAME_oneline(X509_get_subject_name(sk_X509_value(verified_chain, i)),
+						buf, sizeof buf);
+				g_warning("Certificate %d (%s) will exipre in less than a month!", i + 1, buf);
+			}
+		}
+
+		sk_X509_pop_free(verified_chain, X509_free);
+	} else {
+		g_message("No keyring given, skipping signature verification");
+	}
 out:
 	ERR_print_errors_fp(stdout);
 	BIO_free_all(incontent);
@@ -191,7 +446,8 @@ gchar* get_pubkey_hash(X509 *cert)
 {
 	gchar *data = NULL;
 	GString *string;
-	unsigned char *der_buf, *tmp_buf = NULL;
+	g_autofree unsigned char *der_buf = NULL;
+	unsigned char *tmp_buf = NULL;
 	unsigned int len = 0;
 	unsigned int n = 0;
 	unsigned char md[SHA256_DIGEST_LENGTH];
@@ -203,7 +459,7 @@ gchar* get_pubkey_hash(X509 *cert)
 
 	len = i2d_X509_PUBKEY(X509_get_X509_PUBKEY(cert), NULL);
 	if (len <= 0) {
-		g_warning("DER Encoding failed\n");
+		g_warning("DER Encoding failed");
 		goto out;
 	}
 	/* As i2d_X509_PUBKEY() moves pointer after end of data,
@@ -214,7 +470,7 @@ gchar* get_pubkey_hash(X509 *cert)
 	g_assert(((unsigned int)(tmp_buf - der_buf)) == len);
 
 	if (!EVP_Digest(der_buf, len, md, &n, EVP_sha256(), NULL)) {
-		g_warning("Error in EVP_Digest\n");
+		g_warning("Error in EVP_Digest");
 		goto out;
 	}
 
@@ -227,7 +483,6 @@ gchar* get_pubkey_hash(X509 *cert)
 
 	data = g_string_free(string, FALSE);
 out:
-	g_clear_pointer(&der_buf, g_free);
 	return data;
 }
 
@@ -275,14 +530,32 @@ gchar* print_signer_cert(STACK_OF(X509) *verified_chain)
 	return ret;
 }
 
+static gchar* get_cert_time(const ASN1_TIME *time)
+{
+	BIO *mem;
+	gchar *data, *ret;
+	gsize size;
+
+	mem = BIO_new(BIO_s_mem());
+	ASN1_TIME_print(mem, time);
+
+	size = BIO_get_mem_data(mem, &data);
+	ret = g_strndup(data, size);
+
+	BIO_set_close(mem, BIO_CLOSE);
+	BIO_free(mem);
+
+	return ret;
+}
+
 gchar* print_cert_chain(STACK_OF(X509) *verified_chain)
 {
-	GString *text = g_string_new(NULL);
+	GString *text = NULL;
 	char buf[BUFSIZ];
 
 	g_return_val_if_fail(verified_chain != NULL, NULL);
 
-	g_string_append(text, "Certificate Chain:\n");
+	text = g_string_new("Certificate Chain:\n");
 	for (int i = 0; i < sk_X509_num(verified_chain); i++) {
 		X509_NAME_oneline(X509_get_subject_name(sk_X509_value(verified_chain, i)),
 				buf, sizeof buf);
@@ -291,6 +564,8 @@ gchar* print_cert_chain(STACK_OF(X509) *verified_chain)
 				buf, sizeof buf);
 		g_string_append_printf(text, "   Issuer: %s\n", buf);
 		g_string_append_printf(text, "   SPKI sha256: %s\n", get_pubkey_hash(sk_X509_value(verified_chain, i)));
+		g_string_append_printf(text, "   Not Before: %s\n", get_cert_time(X509_get0_notBefore((const X509*) sk_X509_value(verified_chain, i))));
+		g_string_append_printf(text, "   Not After:  %s\n", get_cert_time(X509_get0_notAfter((const X509*) sk_X509_value(verified_chain, i))));
 	}
 
 	return g_string_free(text, FALSE);
@@ -365,7 +640,7 @@ gboolean cms_get_cert_chain(CMS_ContentInfo *cms, X509_STORE *store, STACK_OF(X5
 	/* The first element in the chain must be the signer certificate */
 	g_assert(X509_cmp(sk_X509_value(signers, 0), sk_X509_value(*verified_chain, 0)) == 0);
 
-	g_debug("Got %d chain elements", sk_X509_num(*verified_chain));
+	g_debug("Got %d elements for trust chain", sk_X509_num(*verified_chain));
 
 	res = TRUE;
 out:
@@ -375,6 +650,37 @@ out:
 		sk_X509_free(signers);
 
 	return res;
+}
+
+/* while OpenSSL 1.1.x provides a function for converting ASN1_TIME to tm,
+ * OpenSSL 1.0.x does not.
+ * Instead of coding an own conversion routine which might introduce bugs
+ * unnecessarily, we use the existing conversion capabilities of
+ * ASN1_TIME_print() and strptime() by taking the string representation as
+ * intermediate format. */
+static gboolean asn1_time_to_tm(const ASN1_TIME *intime, struct tm *tm)
+{
+	BIO *mem;
+	long size;
+	gchar *data;
+	g_autofree gchar *ret;
+
+	mem = BIO_new(BIO_s_mem());
+
+	ASN1_TIME_print(mem, intime);
+
+	size = BIO_get_mem_data(mem, &data);
+	ret = g_strndup(data, size);
+
+	g_debug("Obtained signing time: %s", ret);
+
+	if (!strptime(ret, "%b %d %H:%M:%S %Y GMT", tm))
+		return FALSE;
+
+	BIO_set_close(mem, BIO_CLOSE);
+	BIO_free(mem);
+
+	return TRUE;
 }
 
 gboolean cms_verify(GBytes *content, GBytes *sig, CMS_ContentInfo **cms, X509_STORE **store, GError **error)
@@ -431,6 +737,39 @@ gboolean cms_verify(GBytes *content, GBytes *sig, CMS_ContentInfo **cms, X509_ST
 		goto out;
 	}
 
+	/* Optionally use certificate signing timestamp for verification */
+	if (r_context()->config->use_bundle_signing_time) {
+		STACK_OF(CMS_SignerInfo) *sinfos;
+		CMS_SignerInfo *si;
+		X509_ATTRIBUTE *xa;
+		ASN1_TYPE *so;
+		X509_VERIFY_PARAM *param = X509_VERIFY_PARAM_new();
+		struct tm tm;
+		time_t signingtime;
+
+		/* Extract signing time from pkcs9 attributes */
+		sinfos = CMS_get0_SignerInfos(icms);
+		si = sk_CMS_SignerInfo_value(sinfos, 0);
+		xa = CMS_signed_get_attr(si, CMS_signed_get_attr_by_NID(si, NID_pkcs9_signingTime, -1));
+		so = X509_ATTRIBUTE_get0_type(xa, 0);
+
+		/* convert to time_t to make it usable for seting verify parameter */
+		if (!asn1_time_to_tm(so->value.utctime, &tm)) {
+			g_set_error(
+					error,
+					R_SIGNATURE_ERROR,
+					R_SIGNATURE_ERROR_UNKNOWN,
+					"Failed to convert bundle signing time");
+			goto out;
+		}
+		signingtime = timegm(&tm);
+
+		/* use signing time for verification */
+		X509_VERIFY_PARAM_set_time(param, signingtime);
+		X509_STORE_set1_param(istore, param);
+		X509_VERIFY_PARAM_free(param);
+	}
+
 	if (!CMS_verify(icms, NULL, istore, incontent, NULL, CMS_DETACHED | CMS_BINARY)) {
 		unsigned long err;
 		const gchar *data;
@@ -467,8 +806,8 @@ out:
 GBytes *cms_sign_file(const gchar *filename, const gchar *certfile, const gchar *keyfile, gchar **interfiles, GError **error)
 {
 	GError *ierror = NULL;
-	GMappedFile *file;
-	GBytes *content = NULL;
+	g_autoptr(GMappedFile) file = NULL;
+	g_autoptr(GBytes) content = NULL;
 	GBytes *sig = NULL;
 
 	g_return_val_if_fail(filename != NULL, FALSE);
@@ -490,16 +829,14 @@ GBytes *cms_sign_file(const gchar *filename, const gchar *certfile, const gchar 
 	}
 
 out:
-	g_clear_pointer(&content, g_bytes_unref);
-	g_clear_pointer(&file, g_mapped_file_unref);
 	return sig;
 }
 
 gboolean cms_verify_file(const gchar *filename, GBytes *sig, gsize limit, CMS_ContentInfo **cms, X509_STORE **store, GError **error)
 {
 	GError *ierror = NULL;
-	GMappedFile *file;
-	GBytes *content = NULL;
+	g_autoptr(GMappedFile) file = NULL;
+	g_autoptr(GBytes) content = NULL;
 	gboolean res = FALSE;
 
 	g_return_val_if_fail(filename != NULL, FALSE);
@@ -528,8 +865,6 @@ gboolean cms_verify_file(const gchar *filename, GBytes *sig, gsize limit, CMS_Co
 	}
 
 out:
-	g_clear_pointer(&content, g_bytes_unref);
-	g_clear_pointer(&file, g_mapped_file_unref);
 	return res;
 }
 

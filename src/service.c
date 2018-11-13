@@ -96,11 +96,11 @@ static gboolean r_on_handle_info(RInstaller *interface,
 		GDBusMethodInvocation  *invocation,
 		const gchar *arg_bundle)
 {
-	gchar* tmpdir = NULL;
-	gchar* bundledir = NULL;
-	gchar* manifestpath = NULL;
+	g_autofree gchar* tmpdir = NULL;
+	g_autofree gchar* bundledir = NULL;
+	g_autofree gchar* manifestpath = NULL;
 	RaucManifest *manifest = NULL;
-	RaucBundle *bundle = NULL;
+	g_autoptr(RaucBundle) bundle = NULL;
 	GError *error = NULL;
 	gboolean res = TRUE;
 
@@ -146,10 +146,6 @@ out:
 	if (tmpdir)
 		rm_tree(tmpdir, NULL);
 
-	g_clear_pointer(&tmpdir, g_free);
-	g_clear_pointer(&bundledir, g_free);
-	g_clear_pointer(&manifestpath, g_free);
-
 	if (res) {
 		r_installer_complete_info(
 				interface,
@@ -163,8 +159,6 @@ out:
 				"rauc info error");
 	}
 
-	g_clear_pointer(&bundle, free_bundle);
-
 	return TRUE;
 }
 
@@ -173,8 +167,8 @@ static gboolean r_on_handle_mark(RInstaller *interface,
 		const gchar *arg_state,
 		const gchar *arg_slot_identifier)
 {
-	gchar *slot_name = NULL;
-	gchar *message = NULL;
+	g_autofree gchar *slot_name = NULL;
+	g_autofree gchar *message = NULL;
 	GError *ierror = NULL;
 	gboolean res;
 
@@ -205,9 +199,6 @@ out:
 	if (message)
 		g_message("rauc mark: %s", message);
 
-	g_free(slot_name);
-	g_free(message);
-
 	return TRUE;
 }
 
@@ -217,19 +208,12 @@ out:
 static GVariant* convert_slot_status_to_dict(RaucSlot *slot)
 {
 	RaucSlotStatus *slot_state = NULL;
-	GError *ierror = NULL;
-	gboolean good = FALSE;
 	GVariantDict dict;
 
 	load_slot_status(slot);
 	slot_state = slot->status;
 
 	g_variant_dict_init(&dict, NULL);
-
-	if (slot->bootname && !r_boot_get_state(slot, &good, &ierror)) {
-		g_debug("Failed to obtain boot state for %s: %s", slot->name, ierror->message);
-		g_clear_error(&ierror);
-	}
 
 	if (slot->sclass)
 		g_variant_dict_insert(&dict, "class", "s", slot->sclass);
@@ -248,7 +232,7 @@ static GVariant* convert_slot_status_to_dict(RaucSlot *slot)
 	if (slot->mount_point)
 		g_variant_dict_insert(&dict, "mountpoint", "s", slot->mount_point);
 	if (slot->bootname)
-		g_variant_dict_insert(&dict, "boot-status", "s", good ? "good" : "bad");
+		g_variant_dict_insert(&dict, "boot-status", "s", slot->boot_good ? "good" : "bad");
 
 	if (slot_state->bundle_compatible)
 		g_variant_dict_insert(&dict, "bundle.compatible", "s", slot_state->bundle_compatible);
@@ -307,11 +291,15 @@ static GVariant* create_slotstatus_array(void)
 		g_clear_error(&ierror);
 	}
 
+	res = determine_boot_states(&ierror);
+	if (!res) {
+		g_debug("Failed to determine boot states: %s\n", ierror->message);
+		g_clear_error(&ierror);
+	}
+
 	g_hash_table_iter_init(&iter, r_context()->config->slots);
 	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
 		GVariant* slot_status[2];
-
-		g_debug("Adding slot: %s", slot->name);
 
 		slot_status[0] = g_variant_new_string(slot->name);
 		slot_status[1] = convert_slot_status_to_dict(slot);
@@ -342,6 +330,36 @@ static gboolean r_on_handle_get_slot_status(RInstaller *interface,
 				G_IO_ERROR_FAILED_HANDLED,
 				"already processing a different method");
 	}
+
+	return TRUE;
+}
+
+static gboolean r_on_handle_get_primary(RInstaller *interface,
+		GDBusMethodInvocation  *invocation)
+{
+	GError *ierror = NULL;
+	RaucSlot *primary = NULL;
+
+	if (r_context_get_busy()) {
+		g_dbus_method_invocation_return_error(invocation,
+				G_IO_ERROR,
+				G_IO_ERROR_FAILED_HANDLED,
+				"already processing a different method");
+		return TRUE;
+	}
+
+	primary = r_boot_get_primary(&ierror);
+	if (!primary) {
+		g_dbus_method_invocation_return_error(invocation,
+				G_IO_ERROR,
+				G_IO_ERROR_FAILED_HANDLED,
+				"Failed getting primary slot: %s\n", ierror->message);
+		g_printerr("Failed getting primary slot: %s\n", ierror->message);
+		g_clear_error(&ierror);
+		return TRUE;
+	}
+
+	r_installer_complete_get_primary(interface, invocation, primary->name);
 
 	return TRUE;
 }
@@ -424,6 +442,10 @@ static void r_on_bus_acquired(GDBusConnection *connection,
 			G_CALLBACK(r_on_handle_get_slot_status),
 			NULL);
 
+	g_signal_connect(r_installer, "handle-get-primary",
+			G_CALLBACK(r_on_handle_get_primary),
+			NULL);
+
 	r_context_register_progress_callback(send_progress_callback);
 
 	// Set initial Operation status to "idle"
@@ -436,6 +458,10 @@ static void r_on_bus_acquired(GDBusConnection *connection,
 		g_error("Failed to export interface: %s", ierror->message);
 		g_error_free(ierror);
 	}
+
+	r_installer_set_compatible(r_installer, r_context()->config->system_compatible);
+	r_installer_set_variant(r_installer, r_context()->config->system_variant);
+	r_installer_set_boot_slot(r_installer, r_context()->bootslot);
 
 	return;
 }
@@ -456,11 +482,16 @@ static void r_on_name_lost(GDBusConnection *connection,
 		const gchar     *name,
 		gpointer user_data)
 {
+	gboolean *service_return = (gboolean*)user_data;
+
 	if (connection == NULL) {
-		g_message("Connection to the bus can't be made for %s", name);
+		g_printerr("Connection to the bus can't be made for %s\n", name);
 	} else {
-		g_message("Failed to obtain name %s", name);
+		g_printerr("Failed to obtain name %s\n", name);
 	}
+
+	/* Abort service with exit code */
+	*service_return = FALSE;
 
 	if (service_loop) {
 		g_main_loop_quit(service_loop);
@@ -480,6 +511,7 @@ static gboolean r_on_signal(gpointer user_data)
 
 gboolean r_service_run(void)
 {
+	gboolean service_return = TRUE;
 	GBusType bus_type = (!g_strcmp0(g_getenv("DBUS_STARTER_BUS_TYPE"), "session"))
 	                    ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
 
@@ -494,7 +526,7 @@ gboolean r_service_run(void)
 			r_on_bus_acquired,
 			r_on_name_acquired,
 			r_on_name_lost,
-			NULL, NULL);
+			&service_return, NULL);
 
 	g_main_loop_run(service_loop);
 
@@ -504,5 +536,5 @@ gboolean r_service_run(void)
 	g_main_loop_unref(service_loop);
 	service_loop = NULL;
 
-	return TRUE;
+	return service_return;
 }

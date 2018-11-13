@@ -56,6 +56,7 @@ compatible=FooCorp Super BarBazzer\n\
 bootloader=barebox\n\
 mountprefix=/mnt/myrauc/\n\
 statusfile=/mnt/persistent-rw-fs/system.raucs\n\
+max-bundle-download-size=42\n\
 \n\
 [keyring]\n\
 path=/etc/rauc/keyring/\n\
@@ -73,7 +74,7 @@ device=/dev/rootfs-0\n\
 type=ext4\n\
 bootname=system0\n\
 readonly=false\n\
-ignore-checksum=false\n\
+force-install-same=false\n\
 \n\
 [slot.rootfs.1]\n\
 description=Root filesystem partition 1\n\
@@ -88,7 +89,7 @@ description=Application filesystem partition 0\n\
 device=/dev/appfs-0\n\
 type=ext4\n\
 parent=rootfs.0\n\
-ignore-checksum=true\n\
+force-install-same=true\n\
 \n\
 [slot.appfs.1]\n\
 description=Application filesystem partition 1\n\
@@ -107,6 +108,7 @@ ignore-checksum=true\n";
 	g_assert_cmpstr(config->mount_prefix, ==, "/mnt/myrauc/");
 	g_assert_true(config->activate_installed);
 	g_assert_cmpstr(config->statusfile_path, ==, "/mnt/persistent-rw-fs/system.raucs");
+	g_assert_cmpint(config->max_bundle_download_size, ==, 42);
 
 	g_assert_nonnull(config->slots);
 	slotlist = g_hash_table_get_keys(config->slots);
@@ -118,7 +120,7 @@ ignore-checksum=true\n";
 	g_assert_cmpstr(slot->bootname, ==, "factory0");
 	g_assert_cmpstr(slot->type, ==, "raw");
 	g_assert_true(slot->readonly);
-	g_assert_false(slot->ignore_checksum);
+	g_assert_false(slot->force_install_same);
 	g_assert_null(slot->parent);
 	g_assert(find_config_slot_by_device(config, "/dev/rescue-0") == slot);
 
@@ -129,7 +131,7 @@ ignore-checksum=true\n";
 	g_assert_cmpstr(slot->bootname, ==, "system0");
 	g_assert_cmpstr(slot->type, ==, "ext4");
 	g_assert_false(slot->readonly);
-	g_assert_false(slot->ignore_checksum);
+	g_assert_false(slot->force_install_same);
 	g_assert_null(slot->parent);
 	g_assert(find_config_slot_by_device(config, "/dev/rootfs-0") == slot);
 
@@ -140,7 +142,7 @@ ignore-checksum=true\n";
 	g_assert_cmpstr(slot->bootname, ==, "system1");
 	g_assert_cmpstr(slot->type, ==, "ext4");
 	g_assert_false(slot->readonly);
-	g_assert_false(slot->ignore_checksum);
+	g_assert_false(slot->force_install_same);
 	g_assert_null(slot->parent);
 	g_assert(find_config_slot_by_device(config, "/dev/rootfs-1") == slot);
 
@@ -151,7 +153,7 @@ ignore-checksum=true\n";
 	g_assert_null(slot->bootname);
 	g_assert_cmpstr(slot->type, ==, "ext4");
 	g_assert_false(slot->readonly);
-	g_assert_true(slot->ignore_checksum);
+	g_assert_true(slot->force_install_same);
 	g_assert_nonnull(slot->parent);
 	g_assert(find_config_slot_by_device(config, "/dev/appfs-0") == slot);
 
@@ -162,7 +164,7 @@ ignore-checksum=true\n";
 	g_assert_null(slot->bootname);
 	g_assert_cmpstr(slot->type, ==, "ext4");
 	g_assert_false(slot->readonly);
-	g_assert_true(slot->ignore_checksum);
+	g_assert_true(slot->force_install_same);
 	g_assert_nonnull(slot->parent);
 	g_assert(find_config_slot_by_device(config, "/dev/appfs-1") == slot);
 
@@ -173,6 +175,48 @@ ignore-checksum=true\n";
 	g_assert(find_config_slot_by_device(config, "/dev/xxx0") == NULL);
 
 	free_config(config);
+}
+
+static void config_file_invalid_items(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	RaucConfig *config;
+	GError *ierror = NULL;
+	gchar* pathname;
+
+	const gchar *unknown_group_cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+mountprefix=/mnt/myrauc/\n\
+\n\
+[unknown]\n\
+foo=bar\n\
+";
+	const gchar *unknown_key_cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+mountprefix=/mnt/myrauc/\n\
+foo=bar\n\
+";
+
+	pathname = write_tmp_file(fixture->tmpdir, "unknown_group.conf", unknown_group_cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_false(load_config(pathname, &config, &ierror));
+	g_assert_error(ierror, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_PARSE);
+	g_assert_cmpstr(ierror->message, ==, "Invalid group '[unknown]'");
+	g_clear_error(&ierror);
+
+
+	pathname = write_tmp_file(fixture->tmpdir, "unknown_key.conf", unknown_key_cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_false(load_config(pathname, &config, &ierror));
+	g_assert_error(ierror, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_PARSE);
+	g_assert_cmpstr(ierror->message, ==, "Invalid key 'foo' in group '[system]'");
+	g_clear_error(&ierror);
 }
 
 static void config_file_bootloaders(ConfigFileFixture *fixture,
@@ -265,6 +309,35 @@ readonly=typo\n";
 	g_clear_error(&ierror);
 }
 
+static void config_file_typo_in_boolean_force_install_same_key(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	RaucConfig *config;
+	GError *ierror = NULL;
+	gchar* pathname;
+
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+mountprefix=/mnt/myrauc/\n\
+\n\
+[slot.rescue.0]\n\
+description=Rescue partition\n\
+device=/dev/mtd4\n\
+type=raw\n\
+bootname=factory0\n\
+force-install-same=typo\n";
+
+
+	pathname = write_tmp_file(fixture->tmpdir, "invalid_bootloader.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_false(load_config(pathname, &config, &ierror));
+	g_assert_error(ierror, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE);
+	g_clear_error(&ierror);
+}
+
 static void config_file_typo_in_boolean_ignore_checksum_key(ConfigFileFixture *fixture,
 		gconstpointer user_data)
 {
@@ -315,6 +388,75 @@ activate-installed=typo\n";
 	g_assert_false(load_config(pathname, &config, &ierror));
 	g_assert_error(ierror, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE);
 	g_assert_null(config);
+	g_clear_error(&ierror);
+}
+
+static void config_file_no_max_bundle_download_size(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	RaucConfig *config;
+	GError *ierror = NULL;
+	gchar* pathname;
+
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n";
+
+	pathname = write_tmp_file(fixture->tmpdir, "no_max_bundle_download_size.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_true(load_config(pathname, &config, &ierror));
+	g_assert_null(ierror);
+	g_assert_nonnull(config);
+	g_assert_cmpuint(config->max_bundle_download_size, ==, DEFAULT_MAX_BUNDLE_DOWNLOAD_SIZE);
+
+	free_config(config);
+}
+
+static void config_file_zero_max_bundle_download_size(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	RaucConfig *config;
+	GError *ierror = NULL;
+	gchar* pathname;
+
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+max-bundle-download-size=0\n";
+
+	pathname = write_tmp_file(fixture->tmpdir, "zero_max_bundle_download_size.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_false(load_config(pathname, &config, &ierror));
+	g_assert_error(ierror, R_CONFIG_ERROR, R_CONFIG_ERROR_MAX_BUNDLE_DOWNLOAD_SIZE);
+	g_assert_null(config);
+
+	g_clear_error(&ierror);
+}
+
+static void config_file_typo_in_uint64_max_bundle_download_size(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	RaucConfig *config;
+	GError *ierror = NULL;
+	gchar* pathname;
+
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+max-bundle-download-size=no-uint64\n";
+
+	pathname = write_tmp_file(fixture->tmpdir, "invalid_max_bundle_download_size.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_false(load_config(pathname, &config, &ierror));
+	g_assert_error(ierror, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE);
+	g_assert_null(config);
+
 	g_clear_error(&ierror);
 }
 
@@ -410,7 +552,7 @@ compatible=FooCorp Super BarBazzer\n\
 bootloader=barebox\n\
 mountprefix=/mnt/myrauc/\n\
 variant-dtb=true\n\
-variant-name=";
+variant-name=xxx";
 
 	pathname = write_tmp_file(fixture->tmpdir, "no_variant.conf", cfg_file_no_variant, NULL);
 	g_assert_nonnull(pathname);
@@ -466,7 +608,74 @@ variant-name=";
 	g_assert_null(config);
 }
 
+static void config_file_no_extra_mount_opts(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	RaucConfig *config;
+	GError *ierror = NULL;
+	g_autofree gchar* pathname = NULL;
+	RaucSlot *slot = NULL;
 
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+mountprefix=/mnt/myrauc/\n\
+activate-installed=false\n\
+\n\
+[slot.rootfs.0]\n\
+device=/dev/null\n";
+
+
+	pathname = write_tmp_file(fixture->tmpdir, "extra_mount.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_true(load_config(pathname, &config, &ierror));
+	g_assert_null(ierror);
+	g_assert_nonnull(config);
+
+
+	slot = g_hash_table_lookup(config->slots, "rootfs.0");
+	g_assert_nonnull(slot);
+	g_assert_cmpstr(slot->extra_mount_opts, ==, NULL);
+
+	free_config(config);
+}
+
+
+static void config_file_extra_mount_opts(ConfigFileFixture *fixture,
+		gconstpointer user_data)
+{
+	RaucConfig *config;
+	GError *ierror = NULL;
+	g_autofree gchar* pathname = NULL;
+	RaucSlot *slot = NULL;
+
+	const gchar *cfg_file = "\
+[system]\n\
+compatible=FooCorp Super BarBazzer\n\
+bootloader=barebox\n\
+mountprefix=/mnt/myrauc/\n\
+activate-installed=false\n\
+\n\
+[slot.rootfs.0]\n\
+device=/dev/null\n\
+extra-mount-opts=ro,noatime\n";
+
+
+	pathname = write_tmp_file(fixture->tmpdir, "extra_mount.conf", cfg_file, NULL);
+	g_assert_nonnull(pathname);
+
+	g_assert_true(load_config(pathname, &config, &ierror));
+	g_assert_null(ierror);
+	g_assert_nonnull(config);
+
+	slot = g_hash_table_lookup(config->slots, "rootfs.0");
+	g_assert_nonnull(slot);
+	g_assert_cmpstr(slot->extra_mount_opts, ==, "ro,noatime");
+
+	free_config(config);
+}
 
 static void config_file_statusfile_missing(ConfigFileFixture *fixture,
 		gconstpointer user_data)
@@ -598,6 +807,9 @@ int main(int argc, char *argv[])
 	g_test_add("/config-file/full-config", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_full_config,
 			config_file_fixture_tear_down);
+	g_test_add("/config-file/invalid-items", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_invalid_items,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/bootloaders", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_bootloaders,
 			config_file_fixture_tear_down);
@@ -607,11 +819,23 @@ int main(int argc, char *argv[])
 	g_test_add("/config-file/typo-in-boolean-readonly-key", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_typo_in_boolean_readonly_key,
 			config_file_fixture_tear_down);
+	g_test_add("/config-file/typo-in-boolean-force-install-same-key", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_typo_in_boolean_force_install_same_key,
+			config_file_fixture_tear_down);
 	g_test_add("/config-file/typo-in-boolean-ignore-checksum-key", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_typo_in_boolean_ignore_checksum_key,
 			config_file_fixture_tear_down);
 	g_test_add("/config-file/typo-in-boolean-activate-installed-key", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_typo_in_boolean_activate_installed_key,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/no-max-bundle-download-size", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_no_max_bundle_download_size,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/zero-max-bundle-download-size", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_zero_max_bundle_download_size,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/typo-in-uint64-max-bundle-download-size", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_typo_in_uint64_max_bundle_download_size,
 			config_file_fixture_tear_down);
 	g_test_add("/config-file/activate-installed-key-set-to-true", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_activate_installed_set_to_true,
@@ -621,6 +845,12 @@ int main(int argc, char *argv[])
 			config_file_fixture_tear_down);
 	g_test_add("/config-file/system-variant", ConfigFileFixture, NULL,
 			config_file_fixture_set_up, config_file_system_variant,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/no-extra-mount-opts", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_no_extra_mount_opts,
+			config_file_fixture_tear_down);
+	g_test_add("/config-file/extra-mount-opts", ConfigFileFixture, NULL,
+			config_file_fixture_set_up, config_file_extra_mount_opts,
 			config_file_fixture_tear_down);
 	g_test_add_func("/config-file/read-slot-status", config_file_test_read_slot_status);
 	g_test_add_func("/config-file/write-read-slot-status", config_file_test_write_slot_status);

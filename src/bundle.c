@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <gio/gio.h>
 #include <glib/gstdio.h>
 #include <string.h>
@@ -9,9 +10,6 @@
 #include "utils.h"
 #include "network.h"
 
-/* Maximum downloadable bundle size (8MB) */
-#define BUNDLE_DL_MAX_SIZE 8*1024*1024
-
 GQuark
 r_bundle_error_quark(void)
 {
@@ -20,7 +18,7 @@ r_bundle_error_quark(void)
 
 static gboolean mksquashfs(const gchar *bundlename, const gchar *contentdir, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 
@@ -65,7 +63,7 @@ out:
 
 static gboolean unsquashfs(const gchar *bundlename, const gchar *contentdir, const gchar *extractfile, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	GPtrArray *args = g_ptr_array_new_full(7, g_free);
@@ -84,6 +82,7 @@ static gboolean unsquashfs(const gchar *bundlename, const gchar *contentdir, con
 
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_STDOUT_SILENCE, &ierror);
 	if (sproc == NULL) {
@@ -111,7 +110,7 @@ out:
 
 static gboolean casync_make_arch(const gchar *idxpath, const gchar *contentpath, const gchar *store, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	GPtrArray *args = g_ptr_array_new_full(15, g_free);
@@ -131,6 +130,7 @@ static gboolean casync_make_arch(const gchar *idxpath, const gchar *contentpath,
 	g_ptr_array_add(iargs, g_strdup(contentpath));
 	g_ptr_array_add(iargs, g_strdup("-C"));
 	g_ptr_array_add(iargs, g_strdup(tmpdir));
+	g_ptr_array_add(iargs, g_strdup("--numeric-owner"));
 	g_ptr_array_add(iargs, g_strdup("&&"));
 	g_ptr_array_add(iargs, g_strdup("casync"));
 	g_ptr_array_add(iargs, g_strdup("make"));
@@ -150,6 +150,7 @@ static gboolean casync_make_arch(const gchar *idxpath, const gchar *contentpath,
 	g_ptr_array_add(args, g_strjoinv(" ", (gchar**) g_ptr_array_free(iargs, FALSE)));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_STDOUT_SILENCE, &ierror);
 	if (sproc == NULL) {
@@ -176,7 +177,7 @@ out:
 
 static gboolean casync_make_blob(const gchar *idxpath, const gchar *contentpath, const gchar *store, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	GPtrArray *args = g_ptr_array_new_full(5, g_free);
@@ -191,6 +192,7 @@ static gboolean casync_make_blob(const gchar *idxpath, const gchar *contentpath,
 	}
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_STDOUT_SILENCE, &ierror);
 	if (sproc == NULL) {
@@ -246,6 +248,39 @@ static gboolean input_stream_read_uint64_all(GInputStream *stream,
 	return res;
 }
 
+#define SQUASHFS_MAGIC			0x73717368
+
+/* Attempts to read and verify the squashfs magic to verify having a valid bundle */
+static gboolean input_stream_check_bundle_identifier(GInputStream *stream, GError **error)
+{
+	GError *ierror = NULL;
+	guint32 squashfs_id;
+	gboolean res;
+	gsize bytes_read;
+
+	res = g_input_stream_read_all(stream, &squashfs_id, sizeof(squashfs_id), &bytes_read, NULL, &ierror);
+	if (!res) {
+		g_propagate_error(error, ierror);
+		return FALSE;
+	}
+	if (bytes_read != sizeof(squashfs_id)) {
+		g_set_error(error,
+				G_IO_ERROR,
+				G_IO_ERROR_PARTIAL_INPUT,
+				"Only %lu of %lu bytes read",
+				bytes_read,
+				sizeof(squashfs_id));
+		return FALSE;
+	}
+
+	if (squashfs_id != SQUASHFS_MAGIC) {
+		g_set_error(error, R_BUNDLE_ERROR, R_BUNDLE_ERROR_IDENTIFIER, "Invalid identifier. Did you pass a valid RAUC bundle?");
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 static gboolean output_stream_write_bytes_all(GOutputStream *stream,
 		GBytes *bytes,
 		GCancellable *cancellable,
@@ -265,7 +300,7 @@ static gboolean input_stream_read_bytes_all(GInputStream *stream,
 		GCancellable *cancellable,
 		GError **error)
 {
-	void *buffer = NULL;
+	g_autofree void *buffer = NULL;
 	gsize bytes_read;
 	gboolean res;
 
@@ -276,21 +311,19 @@ static gboolean input_stream_read_bytes_all(GInputStream *stream,
 	res = g_input_stream_read_all(stream, buffer, count, &bytes_read,
 			cancellable, error);
 	if (!res) {
-		g_free(buffer);
 		return res;
 	}
 	g_assert(bytes_read == count);
-	*bytes = g_bytes_new_take(buffer, count);
+	*bytes = g_bytes_new_take(g_steal_pointer(&buffer), count);
 	return TRUE;
 }
 
 static gboolean sign_bundle(const gchar *bundlename, GError **error)
 {
 	GError *ierror = NULL;
-	GBytes *sig = NULL;
-	GFile *bundlefile = NULL;
-	GFileOutputStream *bundlestream = NULL;
-	gboolean res = FALSE;
+	g_autoptr(GBytes) sig = NULL;
+	g_autoptr(GFile) bundlefile = NULL;
+	g_autoptr(GFileOutputStream) bundlestream = NULL;
 	guint64 offset;
 
 	g_assert_nonnull(r_context()->certpath);
@@ -306,8 +339,7 @@ static gboolean sign_bundle(const gchar *bundlename, GError **error)
 				error,
 				ierror,
 				"failed signing bundle: ");
-		res = FALSE;
-		goto out;
+		return FALSE;
 	}
 
 	bundlefile = g_file_new_for_path(bundlename);
@@ -317,46 +349,38 @@ static gboolean sign_bundle(const gchar *bundlename, GError **error)
 				error,
 				ierror,
 				"failed to open bundle for appending: ");
-		res = FALSE;
-		goto out;
+		return FALSE;
 	}
 
-	res = g_seekable_seek(G_SEEKABLE(bundlestream),
-			0, G_SEEK_END, NULL, &ierror);
-	if (!res) {
+	if (!g_seekable_seek(G_SEEKABLE(bundlestream),
+			    0, G_SEEK_END, NULL, &ierror)) {
 		g_propagate_prefixed_error(
 				error,
 				ierror,
 				"failed to seek to end of bundle: ");
-		goto out;
+		return FALSE;
 	}
 
 	offset = g_seekable_tell((GSeekable *)bundlestream);
-	res = output_stream_write_bytes_all((GOutputStream *)bundlestream, sig, NULL, &ierror);
-	if (!res) {
+	if (!output_stream_write_bytes_all((GOutputStream *)bundlestream, sig, NULL, &ierror)) {
 		g_propagate_prefixed_error(
 				error,
 				ierror,
 				"failed to append signature to bundle: ");
-		goto out;
+		return FALSE;
 	}
 
 
 	offset = g_seekable_tell((GSeekable *)bundlestream) - offset;
-	res = output_stream_write_uint64_all((GOutputStream *)bundlestream, offset, NULL, &ierror);
-	if (!res) {
+	if (!output_stream_write_uint64_all((GOutputStream *)bundlestream, offset, NULL, &ierror)) {
 		g_propagate_prefixed_error(
 				error,
 				ierror,
 				"failed to append signature size to bundle: ");
-		goto out;
+		return FALSE;
 	}
 
-out:
-	g_clear_object(&bundlestream);
-	g_clear_object(&bundlefile);
-	g_clear_pointer(&sig, g_bytes_unref);
-	return res;
+	return TRUE;
 }
 
 gboolean create_bundle(const gchar *bundlename, const gchar *contentdir, GError **error)
@@ -373,6 +397,7 @@ gboolean create_bundle(const gchar *bundlename, const gchar *contentdir, GError 
 	res = sign_bundle(bundlename, &ierror);
 	if (!res) {
 		g_propagate_error(error, ierror);
+		g_remove(bundlename);
 		goto out;
 	}
 
@@ -383,9 +408,10 @@ out:
 
 static gboolean truncate_bundle(const gchar *inpath, const gchar *outpath, gsize size, GError **error)
 {
-	GFile *infile, *outfile = NULL;
-	GFileInputStream *instream = NULL;
-	GFileOutputStream *outstream = NULL;
+	g_autoptr(GFile) infile = NULL;
+	g_autoptr(GFile) outfile = NULL;
+	g_autoptr(GFileInputStream) instream = NULL;
+	g_autoptr(GFileOutputStream) outstream = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	gssize ssize;
@@ -432,9 +458,6 @@ static gboolean truncate_bundle(const gchar *inpath, const gchar *outpath, gsize
 
 	res = TRUE;
 out:
-	g_clear_object(&outstream);
-	g_clear_object(&infile);
-	g_clear_object(&outfile);
 	return res;
 }
 
@@ -454,6 +477,7 @@ gboolean resign_bundle(RaucBundle *bundle, const gchar *outpath, GError **error)
 	res = sign_bundle(outpath, &ierror);
 	if (!res) {
 		g_propagate_error(error, ierror);
+		g_remove(outpath);
 		goto out;
 	}
 
@@ -476,8 +500,12 @@ static gboolean convert_to_casync_bundle(RaucBundle *bundle, const gchar *outbun
 {
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	gchar *tmpdir = NULL, *contentdir = NULL, *mfpath = NULL, *storepath = NULL, *basepath = NULL;
-	RaucManifest *manifest = NULL;
+	g_autofree gchar *tmpdir = NULL;
+	g_autofree gchar *contentdir = NULL;
+	g_autofree gchar *mfpath = NULL;
+	g_autofree gchar *storepath = NULL;
+	gchar *basepath = NULL;
+	g_autoptr(RaucManifest) manifest = NULL;
 
 	g_return_val_if_fail(bundle, FALSE);
 	g_return_val_if_fail(outbundle, FALSE);
@@ -527,7 +555,9 @@ static gboolean convert_to_casync_bundle(RaucBundle *bundle, const gchar *outbun
 	/* Iterate over each image and convert */
 	for (GList *l = manifest->images; l != NULL; l = l->next) {
 		RaucImage *image = l->data;
-		gchar *imgpath = NULL, *idxfile = NULL, *idxpath = NULL;
+		g_autofree gchar *imgpath = NULL;
+		g_autofree gchar *idxfile = NULL;
+		g_autofree gchar *idxpath = NULL;
 
 		imgpath = g_build_filename(contentdir, image->filename, NULL);
 
@@ -539,9 +569,6 @@ static gboolean convert_to_casync_bundle(RaucBundle *bundle, const gchar *outbun
 
 			res = casync_make_arch(idxpath, imgpath, storepath, &ierror);
 			if (!res) {
-				g_free(idxpath);
-				g_free(imgpath);
-
 				g_propagate_error(error, ierror);
 				goto out;
 			}
@@ -555,9 +582,6 @@ static gboolean convert_to_casync_bundle(RaucBundle *bundle, const gchar *outbun
 			/* Generate index for content */
 			res = casync_make_blob(idxpath, imgpath, storepath, &ierror);
 			if (!res) {
-				g_free(idxpath);
-				g_free(imgpath);
-
 				g_propagate_error(error, ierror);
 				goto out;
 			}
@@ -565,15 +589,12 @@ static gboolean convert_to_casync_bundle(RaucBundle *bundle, const gchar *outbun
 
 		/* Rewrite manifest filename */
 		g_free(image->filename);
-		image->filename = idxfile;
+		image->filename = g_steal_pointer(&idxfile);
 
 		/* Remove original file */
 		if (g_remove(imgpath) != 0) {
 			g_warning("Failed removing %s", imgpath);
 		}
-
-		g_free(idxpath);
-		g_free(imgpath);
 	}
 
 	/* Rewrite manifest to content/ dir */
@@ -594,12 +615,6 @@ out:
 	/* Remove temporary bundle creation directory */
 	if (tmpdir)
 		rm_tree(tmpdir, NULL);
-
-	g_clear_pointer(&manifest, free_manifest);
-	g_clear_pointer(&tmpdir, g_free);
-	g_clear_pointer(&contentdir, g_free);
-	g_clear_pointer(&mfpath, g_free);
-	g_clear_pointer(&storepath, g_free);
 	return res;
 }
 
@@ -636,13 +651,13 @@ static gboolean is_remote_scheme(const gchar *scheme)
 gboolean check_bundle(const gchar *bundlename, RaucBundle **bundle, gboolean verify, GError **error)
 {
 	GError *ierror = NULL;
-	GBytes *sig = NULL;
-	GFile *bundlefile = NULL;
-	GFileInputStream *bundlestream = NULL;
+	g_autoptr(GBytes) sig = NULL;
+	g_autoptr(GFile) bundlefile = NULL;
+	g_autoptr(GFileInputStream) bundlestream = NULL;
 	guint64 sigsize;
 	goffset offset;
 	gboolean res = FALSE;
-	RaucBundle *ibundle = g_new0(RaucBundle, 1);
+	g_autoptr(RaucBundle) ibundle = g_new0(RaucBundle, 1);
 	gchar *bundlescheme = NULL;
 
 	g_return_val_if_fail(bundle == NULL || *bundle == NULL, FALSE);
@@ -657,7 +672,7 @@ gboolean check_bundle(const gchar *bundlename, RaucBundle **bundle, gboolean ver
 		ibundle->path = g_build_filename(g_get_tmp_dir(), "_download.raucb", NULL);
 
 		g_message("Remote URI detected, downloading bundle to %s...", ibundle->path);
-		res = download_file(ibundle->path, ibundle->origpath, BUNDLE_DL_MAX_SIZE, &ierror);
+		res = download_file(ibundle->path, ibundle->origpath, r_context()->config->max_bundle_download_size, &ierror);
 		if (!res) {
 			g_propagate_prefixed_error(error, ierror, "Failed to download bundle %s: ", ibundle->origpath);
 			goto out;
@@ -701,6 +716,15 @@ gboolean check_bundle(const gchar *bundlename, RaucBundle **bundle, gboolean ver
 				ierror,
 				"Failed to open bundle for reading: ");
 		res = FALSE;
+		goto out;
+	}
+
+	res = input_stream_check_bundle_identifier(G_INPUT_STREAM(bundlestream), &ierror);
+	if (!res) {
+		g_propagate_prefixed_error(
+				error,
+				ierror,
+				"Failed to check bundle identifier: ");
 		goto out;
 	}
 
@@ -794,15 +818,10 @@ gboolean check_bundle(const gchar *bundlename, RaucBundle **bundle, gboolean ver
 	}
 
 	if (bundle)
-		*bundle = ibundle;
+		*bundle = g_steal_pointer(&ibundle);
 
 	res = TRUE;
 out:
-	if (!bundle)
-		free_bundle(ibundle);
-	g_clear_object(&bundlestream);
-	g_clear_object(&bundlefile);
-	g_clear_pointer(&sig, g_bytes_unref);
 	r_context_end_step("check_bundle", res);
 	return res;
 }
@@ -881,7 +900,6 @@ gboolean mount_bundle(RaucBundle *bundle, GError **error)
 
 	res = TRUE;
 out:
-
 	return res;
 }
 
@@ -915,7 +933,9 @@ void free_bundle(RaucBundle *bundle)
 
 	/* In case of a temporary donwload artifact, remove it. */
 	if (bundle->origpath)
-		g_remove(bundle->path);
+		if (g_remove(bundle->path) == -1) {
+			g_warning("Failed removing download artifact %s: %s\n", bundle->path, g_strerror(errno));
+		}
 
 	g_free(bundle->path);
 	g_free(bundle->mount_point);

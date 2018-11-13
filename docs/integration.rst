@@ -123,6 +123,13 @@ A list of slot storage types currently supported by RAUC:
 | vfat     | A block device holding a vfat filesystem..                        |     x       |
 +----------+-------------------------------------------------------------------+-------------+
 
+Depending on this slot storage type and the slot's :ref:`image filename <image.slot-filename>`
+extension, RAUC determines how to extract the image content to the target slot.
+
+While the generic filename extension ``.img`` is supported for all filesystems,
+it is strongly recommended to use explicit extensions (e.g. ``.vfat`` or ``.ext4``)
+when possible, as this allows checking during installation that the slot type is correct.
+
 Grouping Slots
 ^^^^^^^^^^^^^^
 
@@ -161,17 +168,36 @@ In kernel Kconfig you have to enable the following options:
   CONFIG_BLK_DEV_LOOP=y
   CONFIG_SQUASHFS=y
 
+.. _sec_ref_host_tools:
+
+Required Host Tools
+-------------------
+
+To be able to generate bundles, RAUC requires at least the following host tools:
+
+* mksquashfs
+* unsquashfs
+
+When using the RAUC casync integration, the ``casync`` tool and ``fakeroot``
+(for converting archives to directory tree indexes) must also be available.
+
+.. _sec_ref_target_tools:
+
 Required Target Tools
 ---------------------
 
 RAUC requires and uses a set of target tools depending on the type of supported
 storage and used image type.
 
+Mandatory tools for each setup are ``mount`` and ``umount``, either from
+`Busybox <http://www.busybox.net>`_ or
+`util-linux <https://cdn.kernel.org/pub//linux/utils/util-linux/>`_
+
 Note that build systems may handle parts of these dependencies automatically,
 but also in this case you will have to select some of them manually as RAUC
 cannot fully know how you intend to use your system.
 
-:NAND Flash: nandwrite (from `mtd-utils
+:NAND Flash: flash_erase & nandwrite (from `mtd-utils
              <git://git.infradead.org/mtd-utils.git>`_)
 :UBIFS: mkfs.ubifs (from `mtd-utils
                   <git://git.infradead.org/mtd-utils.git>`_)
@@ -183,11 +209,27 @@ cannot fully know how you intend to use your system.
 
     * ``CONFIG_FEATURE_TAR_AUTODETECT=y``
     * ``CONFIG_FEATURE_SEAMLESS_XZ=y``
-:ext2/3/4: mkfs.ext2/3/4 (from `e2fsprogs
+    * ``CONFIG_FEATURE_TAR_LONG_OPTIONS=y``
+
+:ext2/ext3/ext4: mkfs.ext2/mkfs.ext3/mkfs.ext4 (from `e2fsprogs
   <git://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git>`_)
 :vfat: mkfs.vfat (from `dosfstools
                   <https://github.com/dosfstools/dosfstools>`_)
 
+Depending on the bootloader you use on your target, RAUC also needs the right
+tool to interact with it:
+
+:Barebox: barebox-state
+          (from `dt-utils <https://git.pengutronix.de/cgit/tools/dt-utils/>`_)
+:U-Boot: fw_setenv/fw_getenv (from `u-boot <http://git.denx.de/?p=u-boot.git;a=summary>`_)
+:GRUB: grub-editenv
+:EFI: efibootmgr
+
+Note that for running ``rauc info`` on the target (as well as on the host), you
+also need to have the ``unsquashfs`` tool installed.
+
+When using the RAUC casync integration, the ``casync`` tool must also be
+available.
 
 Interfacing with the Bootloader
 -------------------------------
@@ -220,12 +262,12 @@ which is available for many common embedded platforms,
 provides a dedicated boot source selection framework, called *bootchooser*,
 backed by an atomic and redundant storage backend, named *state*.
 
-Barebox state allows you to save the variables required by bootchooser with
+*Barebox state* allows you to save the variables required by bootchooser with
 memory specific storage strategies in all common storage medias,
 such as block devices, mtd (NAND/NOR), EEPROM, and UEFI variables.
 
-The Bootchooser framework maintains information about priority and remaining
-boot attemps while being configurable on how to deal with them for different
+The *Bootchooser* framework maintains information about priority and remaining
+boot attempts while being configurable on how to deal with them for different
 strategies.
 
 
@@ -322,7 +364,9 @@ kernel.
 This assures having a consistent view on the variables in Barebox and Linux.
 
 An example devicetree node for our simple redundant setup will have the
-following basic structure::
+following basic structure
+
+.. code-block:: DTS
 
   state {
     bootstate {
@@ -337,7 +381,9 @@ following basic structure::
 
 In the state node, we set the appropriate compatible to tell the *barebox,state*
 driver to care for it and define where and how we want to store our data.
-This will look similar to this::
+This will look similar to this:
+
+.. code-block:: DTS
 
   state: state {
           magic = <0x4d433230>;
@@ -365,7 +411,7 @@ For each virtual boot target handled by state,
 two uint32 variables ``remaining_attempts`` and ``priority`` need to be
 defined.:
 
-.. code-block:: c
+.. code-block:: DTS
 
   bootstate {
 
@@ -393,7 +439,9 @@ defined.:
   state driver will load in case of uninitialized backend storage.
 
 Additionally one single variable for storing information about the last chosen
-boot target is required::
+boot target is required:
+
+.. code-block:: DTS
 
   bootstate {
 
@@ -497,7 +545,7 @@ U-Boot
 
 To enable handling of redundant booting in U-Boot, manual scripting is
 required.
-U-Boot allows storing and modifying variables in its *Envionment*.
+U-Boot allows storing and modifying variables in its *Environment*.
 Properly configured it can be accessed both from U-Boot itself as
 well as from Linux userspace.
 
@@ -691,7 +739,7 @@ Depending on your configuration ``make install`` will place this file in one of
 your system's service file folders.
 
 It is a good idea to wait for the system to be fully started before marking it
-as succesfully booted.
+as successfully booted.
 In order to achieve this, a smart solution is to create a systemd service that calls
 ``rauc status mark-good`` and use systemd's dependency handling to assure this
 service will not be executed before all relevant other services came up
@@ -859,7 +907,7 @@ meta-rauc will look as follows::
 
 
 To be able to build a signed image of this, you also need to configure
-``RAUC_KEY_FILE`` and ``RAUC_CERT_FILE`` to point to your key and certifcate
+``RAUC_KEY_FILE`` and ``RAUC_CERT_FILE`` to point to your key and certificate
 files you intend to use for signing. You may set them either from your bundle
 recipe or any global configuration (layer, site.conf, etc.), e.g.::
 

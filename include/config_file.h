@@ -5,10 +5,14 @@
 #include <checksum.h>
 #include "manifest.h"
 
+/* Default maximum downloadable bundle size (8 MiB) */
+#define DEFAULT_MAX_BUNDLE_DOWNLOAD_SIZE 8*1024*1024
+
 typedef enum {
 	R_CONFIG_ERROR_INVALID_FORMAT,
 	R_CONFIG_ERROR_BOOTLOADER,
-	R_CONFIG_ERROR_PARENT
+	R_CONFIG_ERROR_PARENT,
+	R_CONFIG_ERROR_MAX_BUNDLE_DOWNLOAD_SIZE
 } RConfigError;
 
 #define R_CONFIG_ERROR r_config_error_quark()
@@ -28,6 +32,8 @@ typedef struct {
 	gchar *system_variant;
 	gchar *system_bootloader;
 	gchar *system_bb_statename;
+	/* maximum filesize to download in bytes */
+	guint64 max_bundle_download_size;
 	/* path prefix where rauc may create mount directories */
 	gchar *mount_prefix;
 	gchar *store_path;
@@ -35,6 +41,7 @@ typedef struct {
 	gboolean activate_installed;
 	gchar *statusfile_path;
 	gchar *keyring_path;
+	gboolean use_bundle_signing_time;
 
 	gchar *autoinstall_path;
 	gchar *preinstall_handler;
@@ -91,10 +98,13 @@ typedef struct _RaucSlot {
 	/** flag indicating if the slot is updatable */
 	gboolean readonly;
 	/** flag indicating if the slot update may be forced */
-	gboolean ignore_checksum;
+	gboolean force_install_same;
+	/** extra mount options for this slot */
+	gchar *extra_mount_opts;
 
 	/** current state of the slot (runtime) */
 	SlotState state;
+	gboolean boot_good;
 	struct _RaucSlot *parent;
 	gchar *mount_point;
 	gchar *ext_mount_point;
@@ -140,6 +150,8 @@ RaucSlot *find_config_slot_by_device(RaucConfig *config, const gchar *device);
  * @param config a RaucConfig
  */
 void free_config(RaucConfig *config);
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(RaucConfig, free_config);
 
 /**
  * Load a single slot status from a file into a pre-allocated status structure.
@@ -204,6 +216,8 @@ gboolean save_slot_status(RaucSlot *dest_slot, GError **error);
  */
 void r_free_slot(gpointer value);
 
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(RaucSlot, r_free_slot);
+
 /**
  * Check if slot type is mountable.
  *
@@ -221,3 +235,12 @@ gboolean is_slot_mountable(RaucSlot *slot);
  * @return string representation of slot state
  */
 gchar* slotstate_to_str(SlotState slotstate);
+
+/**
+ * Get SlotState from string representation.
+ *
+ * @param str string representation of state
+ *
+ * @return corresponding SlotState value
+ */
+SlotState str_to_slotstate(gchar *str);

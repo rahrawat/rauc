@@ -5,15 +5,24 @@
 #include <checksum.h>
 
 #if ENABLE_NETWORK
-void network_init(void);
+/**
+ * Network initalization routine.
+ *
+ * Sets up libcurl.
+ *
+ * @param error return location for a GError, or NULL
+ *
+ * @return TRUE if succeeded, FALSE if failed
+ */
+gboolean network_init(GError **error);
 #else
-static inline void network_init(void)
+static inline gboolean network_init(GError **error)
 {
-	return;
+	return TRUE;
 }
 #endif
 
 gboolean download_file(const gchar *target, const gchar *url, gsize limit, GError **error);
 gboolean download_file_checksum(const gchar *target, const gchar *url,
 		const RaucChecksum *checksum);
-gboolean download_mem(GBytes **data, const gchar *url, gsize limit);
+gboolean download_mem(GBytes **data, const gchar *url, gsize limit, GError **error);

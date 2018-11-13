@@ -49,7 +49,7 @@ AS_IF([test "x$enable_service" != "xno"], [
 ])
 
 # Checks for libraries.
-PKG_CHECK_MODULES([GLIB], [glib-2.0 >= 2.40 gio-2.0 gio-unix-2.0])
+PKG_CHECK_MODULES([GLIB], [glib-2.0 >= 2.45.8 gio-2.0 gio-unix-2.0])
 
 AC_ARG_ENABLE([network],
        AS_HELP_STRING([--disable-network], [Disable network update mode])
@@ -102,6 +102,12 @@ AC_SUBST(DBUS_SYSTEMSERVICEDIR)
 
 # Checks for header files.
 
+AC_CHECK_HEADER([linux/mmc/ioctl.h],
+	AC_DEFINE([ENABLE_EMMC_BOOT_SUPPORT], [1], [Define to 1 to enable eMMC boot support]),
+	AC_DEFINE([ENABLE_EMMC_BOOT_SUPPORT], [0]))
+
+AM_CONDITIONAL([WANT_EMMC_BOOT_SUPPORT], [test x$ac_cv_header_linux_mmc_ioctl_h != xno])
+
 # Checks for typedefs, structures, and compiler characteristics.
 
 # Checks for library functions.
@@ -122,12 +128,16 @@ AC_CONFIG_LINKS([test/openssl-ca/manifest:test/openssl-ca/manifest])
 AC_CONFIG_LINKS([test/openssl-ca/root/ca.cert.pem:test/openssl-ca/root/ca.cert.pem])
 AC_CONFIG_LINKS([test/openssl-ca/root/private/ca.key.pem:test/openssl-ca/root/private/ca.key.pem])
 AC_CONFIG_LINKS([test/openssl-ca/dev/autobuilder-1.cert.pem:test/openssl-ca/dev/autobuilder-1.cert.pem])
+AC_CONFIG_LINKS([test/openssl-ca/dev/autobuilder-2.cert.pem:test/openssl-ca/dev/autobuilder-2.cert.pem])
 AC_CONFIG_LINKS([test/openssl-ca/dev/private/autobuilder-1.pem:test/openssl-ca/dev/private/autobuilder-1.pem])
+AC_CONFIG_LINKS([test/openssl-ca/dev/private/autobuilder-2.pem:test/openssl-ca/dev/private/autobuilder-2.pem])
 AC_CONFIG_LINKS([test/openssl-ca/dev-ca.pem:test/openssl-ca/dev-ca.pem])
 AC_CONFIG_LINKS([test/openssl-ca/rel-ca.pem:test/openssl-ca/rel-ca.pem])
 AC_CONFIG_LINKS([test/openssl-ca/provisioning-ca.pem:test/openssl-ca/provisioning-ca.pem])
 AC_CONFIG_LINKS([test/openssl-ca/rel/release-1.cert.pem:test/openssl-ca/rel/release-1.cert.pem])
+AC_CONFIG_LINKS([test/openssl-ca/rel/release-2018.cert.pem:test/openssl-ca/rel/release-2018.cert.pem])
 AC_CONFIG_LINKS([test/openssl-ca/rel/private/release-1.pem:test/openssl-ca/rel/private/release-1.pem])
+AC_CONFIG_LINKS([test/openssl-ca/rel/private/release-2018.pem:test/openssl-ca/rel/private/release-2018.pem])
 AC_CONFIG_LINKS([test/openssl-ca/rel/ca.cert.pem:test/openssl-ca/rel/ca.cert.pem])
 AC_CONFIG_LINKS([test/openssl-ca/manifest-r1.sig:test/openssl-ca/manifest-r1.sig])
 AC_CONFIG_LINKS([test/rauc.t:test/rauc.t])

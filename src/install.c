@@ -45,21 +45,15 @@ static void install_args_update(RaucInstallArgs *args, const gchar *msg)
 
 static gchar *resolve_loop_device(const gchar *devicepath)
 {
-	gchar *devicename = NULL;
-	gchar *syspath = NULL;
-	gchar *res = NULL;
+	g_autofree gchar *devicename = NULL;
+	g_autofree gchar *syspath = NULL;
 
 	if (!g_str_has_prefix(devicepath, "/dev/loop"))
 		return g_strdup(devicepath);
 
 	devicename = g_path_get_basename(devicepath);
 	syspath = g_build_filename("/sys/block", devicename, "loop/backing_file", NULL);
-	res = g_strchomp(read_file_str(syspath, NULL));
-
-	g_free(syspath);
-	g_free(devicename);
-
-	return res;
+	return g_strchomp(read_file_str(syspath, NULL));
 }
 
 gboolean determine_slot_states(GError **error)
@@ -70,8 +64,6 @@ gboolean determine_slot_states(GError **error)
 	gboolean res = FALSE;
 
 	g_assert_nonnull(r_context()->config);
-
-	r_context_begin_step("determine_slot_states", "Determining slot states", 0);
 
 	if (r_context()->config->slots == NULL) {
 		g_set_error_literal(
@@ -87,14 +79,13 @@ gboolean determine_slot_states(GError **error)
 	mountlist = g_unix_mounts_get(NULL);
 	for (GList *l = mountlist; l != NULL; l = l->next) {
 		GUnixMountEntry *m = (GUnixMountEntry*)l->data;
-		gchar *devicepath = resolve_loop_device(g_unix_mount_get_device_path(m));
+		g_autofree gchar *devicepath = resolve_loop_device(g_unix_mount_get_device_path(m));
 		RaucSlot *s = find_config_slot_by_device(r_context()->config,
 				devicepath);
 		if (s) {
 			s->ext_mount_point = g_strdup(g_unix_mount_get_mount_path(m));
 			g_debug("Found external mountpoint for slot %s at %s", s->name, s->ext_mount_point);
 		}
-		g_free(devicepath);
 	}
 	g_list_free_full(mountlist, (GDestroyNotify)g_unix_mount_free);
 
@@ -158,7 +149,6 @@ gboolean determine_slot_states(GError **error)
 	}
 
 	if (!booted) {
-
 		if (g_strcmp0(r_context()->bootslot, "/dev/nfs") == 0) {
 			g_message("Detected nfs boot, ignoring missing active slot");
 			res = TRUE;
@@ -177,9 +167,27 @@ gboolean determine_slot_states(GError **error)
 
 out:
 	g_clear_pointer(&slotlist, g_list_free);
-	r_context_end_step("determine_slot_states", res);
 
 	return res;
+}
+
+gboolean determine_boot_states(GError **error)
+{
+	GHashTableIter iter;
+	RaucSlot *slot;
+	gchar *name;
+	GError *ierror = NULL;
+
+	/* get boot state */
+	g_hash_table_iter_init(&iter, r_context()->config->slots);
+	while (g_hash_table_iter_next(&iter, (gpointer*) &name, (gpointer*) &slot)) {
+		if (slot->bootname && !r_boot_get_state(slot, &slot->boot_good, &ierror)) {
+			g_propagate_error(error, ierror);
+			return FALSE;
+		}
+	}
+
+	return TRUE;
 }
 
 /* Returns the parent root slot for given slot.
@@ -353,7 +361,6 @@ GHashTable* determine_target_install_group(void)
 	gchar **rootclasses = NULL;
 	GHashTable *targetgroup = NULL;
 	GHashTableIter iter;
-	gboolean res = FALSE;
 	RaucSlot *iterslot = NULL;
 	GList *selected_root_slots = NULL;
 
@@ -384,18 +391,14 @@ GHashTable* determine_target_install_group(void)
 
 
 		if (slot_list_contains(selected_root_slots, parent)) {
-			g_debug("\tAdding mappping: %s -> %s", iterslot->sclass, iterslot->name);
+			g_debug("\tAdding mapping: %s -> %s", iterslot->sclass, iterslot->name);
 			g_hash_table_insert(targetgroup, (gpointer) iterslot->sclass, iterslot);
 		} else {
-			g_debug("\tNo mappping found");
+			g_debug("\tNo mapping found");
 		}
 	}
 
-	res = TRUE;
-
-	if (!res)
-		g_clear_pointer(&targetgroup, g_hash_table_unref);
-	r_context_end_step("determine_target_install_group", res);
+	r_context_end_step("determine_target_install_group", TRUE);
 
 	return targetgroup;
 }
@@ -412,14 +415,21 @@ GList* get_install_images(const RaucManifest *manifest, GHashTable *target_group
 
 	slotclasses = get_all_manifest_slot_classes(manifest);
 
+	/* Find exactly 1 image for each class listed in manifest */
 	for (gchar **cls = slotclasses; *cls != NULL; cls++) {
 		RaucImage *matching_img = NULL;
 
 		for (GList *l = manifest->images; l != NULL; l = l->next) {
 			RaucImage *lookup_image = l->data;
+			RaucSlot *target_slot = NULL;
+
+			/* Not interested in slots of other classes */
+			if (!g_strcmp0(lookup_image->slotclass, *cls) == 0)
+				continue;
 
 			/* Check if target_group contains an appropriate slot for this image */
-			if (!g_hash_table_contains(target_group, lookup_image->slotclass)) {
+			target_slot = g_hash_table_lookup(target_group, lookup_image->slotclass);
+			if (!target_slot) {
 				g_set_error(error,
 						R_INSTALL_ERROR,
 						R_INSTALL_ERROR_FAILED,
@@ -428,9 +438,14 @@ GList* get_install_images(const RaucManifest *manifest, GHashTable *target_group
 				goto out;
 			}
 
-			/* Not interested in slots of other classes */
-			if (!g_strcmp0(lookup_image->slotclass, *cls) == 0)
-				continue;
+			if (target_slot->readonly) {
+				g_set_error(error,
+						R_INSTALL_ERROR,
+						R_INSTALL_ERROR_FAILED,
+						"Target slot for class %s of image %s is readonly", lookup_image->slotclass, lookup_image->filename);
+				g_clear_pointer(&install_images, g_list_free);
+				goto out;
+			}
 
 			/* If this is a default variant and we have no better
 			 * match yet, use it and continue scanning.
@@ -473,19 +488,19 @@ out:
 
 static void parse_handler_output(gchar* line)
 {
-	gchar **split = NULL;
+	g_auto(GStrv) split = NULL;
 
 	g_assert_nonnull(line);
 
 	if (!g_str_has_prefix(line, "<< ")) {
 		g_print("# %s\n", line);
-		goto out;
+		return;
 	}
 
 	split = g_strsplit(line, " ", 5);
 
 	if (!split[1])
-		goto out;
+		return;
 
 	if (g_strcmp0(split[1], "handler") == 0) {
 		g_print("Handler status: %s\n", split[2]);
@@ -498,9 +513,6 @@ static void parse_handler_output(gchar* line)
 	} else {
 		g_print("Unknown command: %s\n", split[1]);
 	}
-
-out:
-	g_strfreev(split);
 }
 
 static gboolean verify_compatible(RaucManifest *manifest)
@@ -523,8 +535,8 @@ static void prepare_environment(GSubprocessLauncher *launcher, gchar *update_sou
 	GHashTableIter iter;
 	RaucSlot *slot;
 	gint slotcnt = 0;
-	gchar *targetlist = NULL;
-	gchar *slotlist = NULL;
+	g_autofree gchar *targetlist = NULL;
+	g_autofree gchar *slotlist = NULL;
 
 	g_subprocess_launcher_setenv(launcher, "RAUC_SYSTEM_CONFIG", r_context()->configpath, TRUE);
 	g_subprocess_launcher_setenv(launcher, "RAUC_CURRENT_BOOTNAME", r_context()->bootslot, TRUE);
@@ -583,6 +595,10 @@ static void prepare_environment(GSubprocessLauncher *launcher, gchar *update_sou
 		g_subprocess_launcher_setenv(launcher, varname, slot->sclass, TRUE);
 		g_clear_pointer(&varname, g_free);
 
+		varname = g_strdup_printf("RAUC_SLOT_TYPE_%i", slotcnt);
+		g_subprocess_launcher_setenv(launcher, varname, slot->type, TRUE);
+		g_clear_pointer(&varname, g_free);
+
 		varname = g_strdup_printf("RAUC_SLOT_DEVICE_%i", slotcnt);
 		g_subprocess_launcher_setenv(launcher, varname, slot->device, TRUE);
 		g_clear_pointer(&varname, g_free);
@@ -598,14 +614,12 @@ static void prepare_environment(GSubprocessLauncher *launcher, gchar *update_sou
 
 	g_subprocess_launcher_setenv(launcher, "RAUC_SLOTS", slotlist, TRUE);
 	g_subprocess_launcher_setenv(launcher, "RAUC_TARGET_SLOTS", targetlist, TRUE);
-	g_clear_pointer(&targetlist, g_free);
-	g_clear_pointer(&slotlist, g_free);
 }
 
 static gboolean launch_and_wait_handler(gchar *update_source, gchar *handler_name, RaucManifest *manifest, GHashTable *target_group, GError **error)
 {
-	GSubprocessLauncher *handlelaunch = NULL;
-	GSubprocess *handleproc = NULL;
+	g_autoptr(GSubprocessLauncher) handlelaunch = NULL;
+	g_autoptr(GSubprocess) handleproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	GInputStream *instream = NULL;
@@ -646,16 +660,14 @@ static gboolean launch_and_wait_handler(gchar *update_source, gchar *handler_nam
 	res = TRUE;
 
 out:
-	g_clear_pointer(&handlelaunch, g_object_unref);
-	g_clear_pointer(&handleproc, g_object_unref);
 	return res;
 }
 
 static gboolean run_bundle_hook(RaucManifest *manifest, gchar* bundledir, const gchar *hook_cmd, GError **error)
 {
-	gchar *hook_name = NULL;
-	GSubprocessLauncher *launcher = NULL;
-	GSubprocess *sproc = NULL;
+	g_autofree gchar *hook_name = NULL;
+	g_autoptr(GSubprocessLauncher) launcher = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	GInputStream *instream = NULL;
 	GDataInputStream *datainstream = NULL;
@@ -723,15 +735,12 @@ static gboolean run_bundle_hook(RaucManifest *manifest, gchar* bundledir, const 
 	}
 
 out:
-	g_clear_pointer(&launcher, g_object_unref);
-	g_clear_pointer(&sproc, g_object_unref);
-	g_clear_pointer(&hook_name, g_free);
 	return res;
 }
 
 static gboolean launch_and_wait_custom_handler(RaucInstallArgs *args, gchar* bundledir, RaucManifest *manifest, GHashTable *target_group, GError **error)
 {
-	gchar* handler_name = NULL;
+	g_autofree gchar* handler_name = NULL;
 	gboolean res = FALSE;
 
 	r_context_begin_step("launch_and_wait_custom_handler", "Launching update handler", 0);
@@ -757,7 +766,6 @@ static gboolean launch_and_wait_custom_handler(RaucInstallArgs *args, gchar* bun
 	res = launch_and_wait_handler(bundledir, handler_name, manifest, target_group, error);
 
 out:
-	g_free(handler_name);
 	r_context_end_step("launch_and_wait_custom_handler", res);
 	return res;
 }
@@ -773,8 +781,8 @@ static gboolean launch_and_wait_default_handler(RaucInstallArgs *args, gchar* bu
 
 	install_images = get_install_images(manifest, target_group, &ierror);
 	if (install_images == NULL) {
-		g_warning("%s", ierror->message);
-		g_clear_error(&ierror);
+		g_propagate_error(error, ierror);
+		goto early_out;
 	}
 
 	/* Allow overriding compatible check by hook */
@@ -803,7 +811,6 @@ static gboolean launch_and_wait_default_handler(RaucInstallArgs *args, gchar* bu
 	}
 
 	/* Mark all parent destination slots non-bootable */
-	g_message("Marking target slot as non-bootable...");
 	for (GList *l = install_images; l != NULL; l = l->next) {
 		RaucSlot *dest_slot = g_hash_table_lookup(target_group, ((RaucImage*)l->data)->slotclass);
 
@@ -813,6 +820,7 @@ static gboolean launch_and_wait_default_handler(RaucInstallArgs *args, gchar* bu
 			continue;
 		}
 
+		g_message("Marking target slot %s as non-bootable...", dest_slot->name);
 		res = r_boot_set_state(dest_slot, FALSE, &ierror);
 
 		if (!res) {
@@ -884,7 +892,7 @@ static gboolean launch_and_wait_default_handler(RaucInstallArgs *args, gchar* bu
 
 		install_args_update(args, g_strdup_printf("Checking slot %s", dest_slot->name));
 
-		r_context_begin_step("check_slot", g_strdup_printf("Checking slot %s", dest_slot->name), 0);
+		r_context_begin_step_formatted("check_slot", 0, "Checking slot %s", dest_slot->name);
 
 		load_slot_status(dest_slot);
 		slot_state = dest_slot->status;
@@ -901,7 +909,7 @@ static gboolean launch_and_wait_default_handler(RaucInstallArgs *args, gchar* bu
 		}
 
 		/* skip if slot is up-to-date */
-		if (!dest_slot->ignore_checksum && g_strcmp0(mfimage->checksum.digest, slot_state->checksum.digest) == 0) {
+		if (!dest_slot->force_install_same && g_strcmp0(mfimage->checksum.digest, slot_state->checksum.digest) == 0) {
 			install_args_update(args, g_strdup_printf("Skipping update for correct image %s", mfimage->filename));
 			g_message("Skipping update for correct image %s", mfimage->filename);
 			r_context_end_step("check_slot", TRUE);
@@ -928,7 +936,7 @@ static gboolean launch_and_wait_default_handler(RaucInstallArgs *args, gchar* bu
 		else
 			g_message("Updating %s with %s", dest_slot->device, mfimage->filename);
 
-		r_context_begin_step("copy_image", "Copying image", 0);
+		r_context_begin_step_formatted("copy_image", 0, "Copying image to %s", dest_slot->name);
 
 		res = update_handler(
 				mfimage,
@@ -937,7 +945,7 @@ static gboolean launch_and_wait_default_handler(RaucInstallArgs *args, gchar* bu
 				&ierror);
 		if (!res) {
 			g_propagate_prefixed_error(error, ierror,
-					"Failed updating slot: ");
+					"Failed updating slot %s: ", dest_slot->name);
 			r_context_end_step("copy_image", FALSE);
 			goto out;
 		}
@@ -981,27 +989,32 @@ image_out:
 
 	if (r_context()->config->activate_installed) {
 		/* Mark all parent destination slots bootable */
-		g_message("Marking slots as bootable...");
 		for (GList *l = install_images; l != NULL; l = l->next) {
 			RaucSlot *dest_slot = g_hash_table_lookup(target_group, ((RaucImage*)l->data)->slotclass);
 
 			if (dest_slot->parent || !dest_slot->bootname)
 				continue;
 
+			g_message("Marking target slot %s as bootable...", dest_slot->name);
 			mark_active(dest_slot, &ierror);
 			if (g_error_matches(ierror, R_INSTALL_ERROR, R_INSTALL_ERROR_MARK_BOOTABLE)) {
-				g_set_error(error, R_INSTALL_ERROR, R_INSTALL_ERROR_MARK_BOOTABLE,
-						"Failed marking slot %s bootable", dest_slot->name);
-				g_clear_error(&ierror);
+				g_propagate_prefixed_error(error, ierror,
+						"Failed marking slot %s bootable: ", dest_slot->name);
+				res = FALSE;
 				goto out;
 			} else if (g_error_matches(ierror, R_INSTALL_ERROR, R_INSTALL_ERROR_FAILED)) {
-				g_set_error(error, R_INSTALL_ERROR, R_INSTALL_ERROR_FAILED,
-						"Marked slot %s bootable, but failed to write status file: %s",
-						dest_slot->name, ierror->message);
-				g_clear_error(&ierror);
+				g_propagate_prefixed_error(error, ierror,
+						"Marked slot %s bootable, but failed to write status file: ",
+						dest_slot->name);
+				res = FALSE;
+				goto out;
+			} else if (ierror) {
+				g_propagate_prefixed_error(error, ierror,
+						"Unexpected error while trying to mark slot %s bootable: ",
+						dest_slot->name);
+				res = FALSE;
 				goto out;
 			}
-			g_clear_error(&ierror);
 		}
 	} else {
 		g_message("Leaving target slot non-bootable as requested by activate_installed == false.");
@@ -1023,13 +1036,13 @@ static gboolean reuse_existing_file_checksum(const RaucChecksum *checksum, const
 {
 	GError *error = NULL;
 	gboolean res = FALSE;
-	gchar *basename = g_path_get_basename(filename);
+	g_autofree gchar *basename = g_path_get_basename(filename);
 	GHashTableIter iter;
 	RaucSlot *slot;
 
 	g_hash_table_iter_init(&iter, r_context()->config->slots);
 	while (g_hash_table_iter_next(&iter, NULL, (gpointer*) &slot)) {
-		gchar *srcname = NULL;
+		g_autofree gchar *srcname = NULL;
 		if (!slot->mount_point)
 			goto next;
 		srcname = g_build_filename(slot->mount_point, basename, NULL);
@@ -1044,12 +1057,10 @@ static gboolean reuse_existing_file_checksum(const RaucChecksum *checksum, const
 		}
 
 next:
-		g_clear_pointer(&srcname, g_free);
 		if (res)
 			break;
 	}
 
-	g_clear_pointer(&basename, g_free);
 	return res;
 }
 
@@ -1095,7 +1106,7 @@ static gboolean launch_and_wait_network_handler(const gchar* base_url,
 
 	// for slot in target_group
 	for (gchar **cls = fileclasses; *cls != NULL; cls++) {
-		gchar *slotstatuspath = NULL;
+		g_autofree gchar *slotstatuspath = NULL;
 		RaucSlotStatus *slot_state = g_new0(RaucSlotStatus, 1);
 
 		RaucSlot *slot = g_hash_table_lookup(target_group, *cls);
@@ -1123,10 +1134,11 @@ static gboolean launch_and_wait_network_handler(const gchar* base_url,
 		// for file targeting this slot
 		for (GList *l = manifest->files; l != NULL; l = l->next) {
 			RaucFile *mffile = l->data;
-			gchar *filename = g_build_filename(slot->mount_point,
+			g_autofree gchar *filename = g_build_filename(
+					slot->mount_point,
 					mffile->destname,
 					NULL);
-			gchar *fileurl = g_strconcat(base_url, "/",
+			g_autofree gchar *fileurl = g_strconcat(base_url, "/",
 					mffile->filename, NULL);
 
 			res = verify_checksum(&mffile->checksum, filename, NULL);
@@ -1151,8 +1163,6 @@ static gboolean launch_and_wait_network_handler(const gchar* base_url,
 			}
 
 file_out:
-			g_clear_pointer(&filename, g_free);
-			g_clear_pointer(&fileurl, g_free);
 			if (!res) {
 				invalid = TRUE;
 				goto slot_out;
@@ -1171,7 +1181,6 @@ file_out:
 		}
 
 slot_out:
-		g_clear_pointer(&slotstatuspath, g_free);
 		g_clear_pointer(&slot_state, free_slot_status);
 		res = r_umount_slot(slot, &ierror);
 		if (!res) {
@@ -1238,16 +1247,19 @@ gboolean do_install_bundle(RaucInstallArgs *args, GError **error)
 	const gchar* bundlefile = args->name;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	RaucManifest *manifest = NULL;
-	RaucBundle *bundle = NULL;
+	g_autoptr(RaucManifest) manifest = NULL;
+	g_autoptr(RaucBundle) bundle = NULL;
 	GHashTable *target_group;
-	gchar* manifestpath = NULL;
+	g_autofree gchar* manifestpath = NULL;
 
 	g_assert_nonnull(bundlefile);
 	g_assert_null(r_context()->install_info->mounted_bundle);
 
 	r_context_begin_step("do_install_bundle", "Installing", 5);
+
+	r_context_begin_step("determine_slot_states", "Determining slot states", 0);
 	res = determine_slot_states(&ierror);
+	r_context_end_step("determine_slot_states", res);
 	if (!res) {
 		g_propagate_error(error, ierror);
 		goto out;
@@ -1290,11 +1302,8 @@ gboolean do_install_bundle(RaucInstallArgs *args, GError **error)
 		goto umount;
 	}
 
-	g_print("Target Group:\n");
-	print_slot_hash_table(target_group);
-
 	if (r_context()->config->preinstall_handler) {
-		g_print("Starting pre install handler: %s\n", r_context()->config->preinstall_handler);
+		g_message("Starting pre install handler: %s", r_context()->config->preinstall_handler);
 		res = launch_and_wait_handler(bundle->mount_point, r_context()->config->preinstall_handler, manifest, target_group, &ierror);
 		if (!res) {
 			g_propagate_prefixed_error(error, ierror, "Pre-install handler error: ");
@@ -1304,20 +1313,20 @@ gboolean do_install_bundle(RaucInstallArgs *args, GError **error)
 
 
 	if (manifest->handler_name) {
-		g_print("Using custom handler: %s\n", manifest->handler_name);
+		g_message("Using custom handler: %s", manifest->handler_name);
 		res = launch_and_wait_custom_handler(args, bundle->mount_point, manifest, target_group, &ierror);
 	} else {
-		g_print("Using default handler\n");
+		g_debug("Using default installation handler");
 		res = launch_and_wait_default_handler(args, bundle->mount_point, manifest, target_group, &ierror);
 	}
 
 	if (!res) {
-		g_propagate_prefixed_error(error, ierror, "Handler error: ");
+		g_propagate_prefixed_error(error, ierror, "Installation error: ");
 		goto umount;
 	}
 
 	if (r_context()->config->postinstall_handler) {
-		g_print("Starting post install handler: %s\n", r_context()->config->postinstall_handler);
+		g_message("Starting post install handler: %s", r_context()->config->postinstall_handler);
 		res = launch_and_wait_handler(bundle->mount_point, r_context()->config->postinstall_handler, manifest, target_group, &ierror);
 		if (!res) {
 			g_propagate_prefixed_error(error, ierror, "Post-install handler error: ");
@@ -1335,9 +1344,6 @@ umount:
 	r_context()->install_info->mounted_bundle = NULL;
 
 out:
-	g_free(manifestpath);
-	g_clear_pointer(&bundle, free_bundle);
-	g_clear_pointer(&manifest, free_manifest);
 	r_context_end_step("do_install_bundle", res);
 
 	return res;
@@ -1348,29 +1354,37 @@ gboolean do_install_network(const gchar *url, GError **error)
 #if ENABLE_NETWORK
 	gboolean res = FALSE;
 	GError *ierror = NULL;
-	gchar *base_url = NULL, *signature_url = NULL;
-	GBytes *manifest_data = NULL, *signature_data = NULL;
-	RaucManifest *manifest = NULL;
-	GHashTable *target_group = NULL;
+	g_autofree gchar *base_url = NULL;
+	g_autofree gchar *signature_url = NULL;
+	g_autoptr(GBytes) manifest_data = NULL;
+	g_autoptr(GBytes) signature_data = NULL;
+	g_autoptr(RaucManifest) manifest = NULL;
+	g_autoptr(GHashTable) target_group = NULL;
 
 	g_assert_nonnull(url);
 
+	g_warning("Network mode is marked as deprecated!\nPlease contact RAUC maintainers if you see this message and intend to use the network mode in future RAUC versions!");
+
+	r_context_begin_step("determine_slot_states", "Determining slot states", 0);
 	res = determine_slot_states(&ierror);
+	r_context_end_step("determine_slot_states", res);
 	if (!res) {
 		g_propagate_error(error, ierror);
 		goto out;
 	}
 
-	res = download_mem(&manifest_data, url, 64*1024);
+	res = download_mem(&manifest_data, url, 64*1024, &ierror);
 	if (!res) {
-		g_set_error_literal(error, R_INSTALL_ERROR, R_INSTALL_ERROR_DOWNLOAD_MF, "Failed to download manifest");
+		g_set_error(error, R_INSTALL_ERROR, R_INSTALL_ERROR_DOWNLOAD_MF, "Failed to download manifest %s: %s", url, ierror->message);
+		g_clear_error(&ierror);
 		goto out;
 	}
 
 	signature_url = g_strconcat(url, ".sig", NULL);
-	res = download_mem(&signature_data, signature_url, 64*1024);
+	res = download_mem(&signature_data, signature_url, 64*1024, &ierror);
 	if (!res) {
-		g_warning("Failed to download manifest signature");
+		g_warning("Failed to download manifest signature: %s", ierror->message);
+		g_clear_error(&ierror);
 		goto out;
 	}
 
@@ -1404,7 +1418,7 @@ gboolean do_install_network(const gchar *url, GError **error)
 	base_url = g_path_get_dirname(url);
 
 	if (r_context()->config->preinstall_handler) {
-		g_print("Starting pre install handler: %s\n", r_context()->config->preinstall_handler);
+		g_message("Starting pre install handler: %s", r_context()->config->preinstall_handler);
 		res = launch_and_wait_handler(base_url, r_context()->config->preinstall_handler, manifest, target_group, &ierror);
 		if (!res) {
 			g_propagate_prefixed_error(error, ierror, "Pre-install handler error: ");
@@ -1413,7 +1427,7 @@ gboolean do_install_network(const gchar *url, GError **error)
 	}
 
 
-	g_print("Using network handler for %s\n", base_url);
+	g_message("Using network handler for %s", base_url);
 	res = launch_and_wait_network_handler(base_url, manifest, target_group, NULL);
 	if (!res) {
 		g_set_error_literal(error, R_INSTALL_ERROR, R_INSTALL_ERROR_HANDLER,
@@ -1422,7 +1436,7 @@ gboolean do_install_network(const gchar *url, GError **error)
 	}
 
 	if (r_context()->config->postinstall_handler) {
-		g_print("Starting post install handler: %s\n", r_context()->config->postinstall_handler);
+		g_message("Starting post install handler: %s", r_context()->config->postinstall_handler);
 		res = launch_and_wait_handler(base_url, r_context()->config->postinstall_handler, manifest, target_group, &ierror);
 		if (!res) {
 			g_propagate_prefixed_error(error, ierror, "Post-install handler error: ");
@@ -1434,13 +1448,6 @@ gboolean do_install_network(const gchar *url, GError **error)
 	res = TRUE;
 
 out:
-	g_clear_pointer(&target_group, g_hash_table_unref);
-	g_clear_pointer(&manifest, free_manifest);
-	g_clear_pointer(&base_url, g_free);
-	g_clear_pointer(&signature_url, g_free);
-	g_clear_pointer(&manifest_data, g_bytes_unref);
-	g_clear_pointer(&signature_data, g_bytes_unref);
-
 	return res;
 #else
 	g_set_error_literal(
@@ -1475,22 +1482,21 @@ static gpointer install_thread(gpointer data)
 	g_debug("thread started for %s", args->name);
 	install_args_update(args, "started");
 
-	if (g_str_has_suffix(args->name, ".raucb")) {
-		result = !do_install_bundle(args, &ierror);
-		if (result != 0) {
-			g_warning("%s", ierror->message);
-			install_args_update(args, ierror->message);
-			set_last_error(ierror->message);
-			g_clear_error(&ierror);
-		}
-	} else {
+	/* Special handling for network mode.
+	 * As bundle mode is our default, we only activate network mode when
+	 * handling a file extension indicating a RAUC manifest
+	 */
+	if (g_str_has_suffix(args->name, ".raucm")) {
 		result = !do_install_network(args->name, &ierror);
-		if (result != 0) {
-			g_warning("%s", ierror->message);
-			install_args_update(args, ierror->message);
-			set_last_error(ierror->message);
-			g_clear_error(&ierror);
-		}
+	} else {
+		result = !do_install_bundle(args, &ierror);
+	}
+
+	if (result != 0) {
+		g_warning("%s", ierror->message);
+		install_args_update(args, ierror->message);
+		set_last_error(ierror->message);
+		g_clear_error(&ierror);
 	}
 
 	g_mutex_lock(&args->status_mutex);
@@ -1525,16 +1531,14 @@ void install_args_free(RaucInstallArgs *args)
 
 gboolean install_run(RaucInstallArgs *args)
 {
-	GThread *thread = NULL;
+	g_autoptr(GThread) thread = NULL;
 	r_context_set_busy(TRUE);
 
-	g_print("Active slot bootname: %s\n", r_context()->bootslot);
+	g_message("Active slot bootname: %s", r_context()->bootslot);
 
 	thread = g_thread_new("installer", install_thread, args);
 	if (thread == NULL)
 		return FALSE;
-
-	g_thread_unref(thread);
 
 	return TRUE;
 }

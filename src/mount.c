@@ -6,12 +6,12 @@
 #include "mount.h"
 #include "utils.h"
 
-gboolean r_mount_full(const gchar *source, const gchar *mountpoint, const gchar* type, gsize size, GError **error)
+gboolean r_mount_full(const gchar *source, const gchar *mountpoint, const gchar* type, gsize size, const gchar* extra_options, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(10, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(10, g_free);
 
 	if (getuid() != 0) {
 		g_ptr_array_add(args, g_strdup("sudo"));
@@ -26,10 +26,15 @@ gboolean r_mount_full(const gchar *source, const gchar *mountpoint, const gchar*
 		g_ptr_array_add(args, g_strdup("-o"));
 		g_ptr_array_add(args, g_strdup_printf("ro,loop,sizelimit=%"G_GSIZE_FORMAT, size));
 	}
+	if (extra_options) {
+		g_ptr_array_add(args, g_strdup("-o"));
+		g_ptr_array_add(args, g_strdup(extra_options));
+	}
 	g_ptr_array_add(args, g_strdup(source));
 	g_ptr_array_add(args, g_strdup(mountpoint));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -51,22 +56,21 @@ gboolean r_mount_full(const gchar *source, const gchar *mountpoint, const gchar*
 
 	res = TRUE;
 out:
-	g_ptr_array_unref(args);
 	return res;
 }
 
 
 gboolean r_mount_loop(const gchar *filename, const gchar *mountpoint, gsize size, GError **error)
 {
-	return r_mount_full(filename, mountpoint, "squashfs", size, error);
+	return r_mount_full(filename, mountpoint, "squashfs", size, NULL, error);
 }
 
 gboolean r_umount(const gchar *filename, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(10, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(10, g_free);
 
 	if (getuid() != 0) {
 		g_ptr_array_add(args, g_strdup("sudo"));
@@ -76,6 +80,7 @@ gboolean r_umount(const gchar *filename, GError **error)
 	g_ptr_array_add(args, g_strdup(filename));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -97,7 +102,6 @@ gboolean r_umount(const gchar *filename, GError **error)
 
 	res = TRUE;
 out:
-	g_ptr_array_unref(args);
 	return res;
 }
 
@@ -129,7 +133,6 @@ gchar* r_create_mount_point(const gchar *name, GError **error)
 	}
 
 out:
-
 	return mountpoint;
 }
 
@@ -162,7 +165,7 @@ gboolean r_mount_slot(RaucSlot *slot, GError **error)
 		goto out;
 	}
 
-	res = r_mount_full(slot->device, mount_point, slot->type, 0, &ierror);
+	res = r_mount_full(slot->device, mount_point, slot->type, 0, slot->extra_mount_opts, &ierror);
 	if (!res) {
 		res = FALSE;
 		g_propagate_prefixed_error(

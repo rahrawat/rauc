@@ -39,7 +39,6 @@ librauc_la_SOURCES = \
 	src/checksum.c \
 	src/config_file.c \
 	src/context.c \
-	src/emmc.c \
 	src/install.c \
 	src/manifest.c \
 	src/mark.c \
@@ -62,6 +61,10 @@ librauc_la_SOURCES = \
 	include/signature.h \
 	include/update_handler.h \
 	include/utils.h
+
+if WANT_EMMC_BOOT_SUPPORT
+librauc_la_SOURCES += src/emmc.c
+endif
 
 if WANT_NETWORK
 librauc_la_SOURCES += src/network.c include/network.h
@@ -98,7 +101,11 @@ EXTRA_DIST += data/rauc.service.in \
 	      data/de.pengutronix.rauc.service.in \
 	      data/rauc-service.sh.in \
 	      README.rst \
-	      CHANGES
+	      CHANGES \
+	      contrib \
+	      build-uncrustify.sh \
+	      .uncrustify.cfg \
+	      uncrustify.sh
 
 AM_TESTS_ENVIRONMENT = \
 	AM_TAP_AWK='$(AWK)'; export AM_TAP_AWK; \
@@ -124,6 +131,10 @@ check_PROGRAMS = \
 if WANT_NETWORK
 check_PROGRAMS += test/network.test
 endif
+
+noinst_PROGRAMS = test/fakerand
+
+test_fakerand_SOURCES = test/fakerand.c
 
 check_LTLIBRARIES = librauctest.la
 

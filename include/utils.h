@@ -2,6 +2,19 @@
 
 #include <glib.h>
 
+#define R_LOG_DOMAIN_SUBPROCESS "rauc-subprocess"
+static inline void r_debug_subprocess(GPtrArray *args)
+{
+	gchar *call = g_strjoinv(" ", (gchar**) args->pdata);
+	g_log(R_LOG_DOMAIN_SUBPROCESS, G_LOG_LEVEL_DEBUG, "launching subprocess: %s", call);
+	g_free(call);
+}
+
+#define R_LOG_LEVEL_TRACE 1 << G_LOG_LEVEL_USER_SHIFT
+#define r_trace(...)   g_log(G_LOG_DOMAIN,         \
+		R_LOG_LEVEL_TRACE,    \
+		__VA_ARGS__)
+
 /**
  * Read file content into a GBytes.
  *
@@ -77,3 +90,13 @@ gboolean rm_tree(const gchar *path, GError **error);
  * @return An absolute path name, determined as described above, NULL if undeterminable
  */
 gchar *resolve_path(const gchar *basefile, gchar *path);
+
+
+gboolean check_remaining_groups(GKeyFile *key_file, GError **error);
+gboolean check_remaining_keys(GKeyFile *key_file, const gchar *groupname, GError **error);
+
+gchar * key_file_consume_string(
+		GKeyFile *key_file,
+		const gchar *group_name,
+		const gchar *key,
+		GError **error);

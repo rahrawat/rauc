@@ -8,7 +8,8 @@ GQuark r_bundle_error_quark(void);
 
 typedef enum {
 	R_BUNDLE_ERROR_SIGNATURE,
-	R_BUNDLE_ERROR_KEYRING
+	R_BUNDLE_ERROR_KEYRING,
+	R_BUNDLE_ERROR_IDENTIFIER
 } RBundleError;
 
 typedef struct {
@@ -139,3 +140,5 @@ gboolean umount_bundle(RaucBundle *bundle, GError **error);
  * @param bundle bundle to free
  */
 void free_bundle(RaucBundle *bundle);
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(RaucBundle, free_bundle);

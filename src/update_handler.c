@@ -12,6 +12,7 @@
 #include "signature.h"
 #include "update_handler.h"
 #include "emmc.h"
+#include "utils.h"
 
 
 #define R_SLOT_HOOK_PRE_INSTALL "slot-pre-install"
@@ -26,9 +27,9 @@ GQuark r_update_error_quark(void)
 }
 
 /* the fd will only live as long as the returned output stream */
-static GOutputStream* open_slot_device(RaucSlot *slot, int *fd, GError **error)
+static GUnixOutputStream* open_slot_device(RaucSlot *slot, int *fd, GError **error)
 {
-	GOutputStream *outstream = NULL;
+	GUnixOutputStream *outstream = NULL;
 	GFile *destslotfile = NULL;
 	GError *ierror = NULL;
 	int fd_out;
@@ -43,7 +44,7 @@ static GOutputStream* open_slot_device(RaucSlot *slot, int *fd, GError **error)
 		goto out;
 	}
 
-	outstream = g_unix_output_stream_new(fd_out, TRUE);
+	outstream = (GUnixOutputStream *) g_unix_output_stream_new(fd_out, TRUE);
 	if (outstream == NULL) {
 		g_propagate_prefixed_error(error, ierror,
 				"failed to open file for writing: ");
@@ -57,16 +58,17 @@ out:
 	return outstream;
 }
 
+#if ENABLE_EMMC_BOOT_SUPPORT == 1
 static gboolean clear_slot(RaucSlot *slot, GError **error)
 {
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	static gchar zerobuf[CLEAR_BLOCK_SIZE] = {};
-	GOutputStream *outstream = NULL;
+	g_autoptr(GOutputStream) outstream = NULL;
 	int out_fd;
 	gint write_count = 0;
 
-	outstream = open_slot_device(slot, &out_fd, &ierror);
+	outstream = (GOutputStream *) open_slot_device(slot, &out_fd, &ierror);
 	if (outstream == NULL) {
 		g_propagate_error(error, ierror);
 		goto out;
@@ -96,9 +98,9 @@ static gboolean clear_slot(RaucSlot *slot, GError **error)
 	res = TRUE;
 
 out:
-	g_clear_object(&outstream);
 	return res;
 }
+#endif
 
 static gboolean ubifs_ioctl(RaucImage *image, int fd, GError **error)
 {
@@ -116,48 +118,58 @@ static gboolean ubifs_ioctl(RaucImage *image, int fd, GError **error)
 	return TRUE;
 }
 
-static gboolean copy_raw_image(RaucImage *image, GOutputStream *outstream, GError **error)
+static gboolean copy_raw_image(RaucImage *image, GUnixOutputStream *outstream, GError **error)
 {
 	GError *ierror = NULL;
 	gssize size;
-	GFile *srcimagefile = g_file_new_for_path(image->filename);
-	gboolean res = FALSE;
+	g_autoptr(GFile) srcimagefile = g_file_new_for_path(image->filename);
+	int out_fd = g_unix_output_stream_get_fd(outstream);
 
-	GInputStream *instream = (GInputStream*)g_file_read(srcimagefile, NULL, &ierror);
+	g_autoptr(GInputStream) instream = (GInputStream*)g_file_read(srcimagefile, NULL, &ierror);
 	if (instream == NULL) {
 		g_propagate_prefixed_error(error, ierror,
-				"failed to open file for reading: ");
-		goto out;
+				"Failed to open file for reading: ");
+		return FALSE;
 	}
 
-	size = g_output_stream_splice(outstream, instream,
+	/* Do not close fd automatically to give us the chance to call fsync() on it before closing */
+	g_unix_output_stream_set_close_fd(outstream, FALSE);
+
+	size = g_output_stream_splice((GOutputStream *) outstream, instream,
 			G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET,
 			NULL,
 			&ierror);
 	if (size == -1) {
 		g_propagate_prefixed_error(error, ierror,
-				"failed splicing data: ");
-		goto out;
+				"Failed splicing data: ");
+		return FALSE;
 	} else if (size != (gssize)image->checksum.size) {
 		g_set_error(error, R_UPDATE_ERROR, R_UPDATE_ERROR_FAILED,
-				"written size (%"G_GSIZE_FORMAT ") != image size (%"G_GSIZE_FORMAT ")", size, (gssize)image->checksum.size);
-		goto out;
+				"Written size (%"G_GSIZE_FORMAT ") != image size (%"G_GSIZE_FORMAT ")", size, (gssize)image->checksum.size);
+		return FALSE;
 	}
 
-	res = TRUE;
+	/* flush to block device before closing to assure content is written to disk */
+	if (fsync(out_fd) == -1) {
+		close(out_fd); /* Silent attempt to close as we failed, anyway */
+		g_set_error(error, R_UPDATE_ERROR, R_UPDATE_ERROR_FAILED, "Syncing content to disk failed: %s", strerror(errno));
+		return FALSE;
+	}
 
-out:
-	g_clear_object(&instream);
-	g_clear_object(&srcimagefile);
-	return res;
+	if (close(out_fd) == -1) {
+		g_set_error(error, R_UPDATE_ERROR, R_UPDATE_ERROR_FAILED, "Closing output device failed: %s", strerror(errno));
+		return FALSE;
+	}
+
+	return TRUE;
 }
 
 static gboolean casync_extract(RaucImage *image, gchar *dest, const gchar *seed, const gchar *store, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(5, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(5, g_free);
 
 	g_ptr_array_add(args, g_strdup("casync"));
 	g_ptr_array_add(args, g_strdup("extract"));
@@ -174,6 +186,7 @@ static gboolean casync_extract(RaucImage *image, gchar *dest, const gchar *seed,
 	g_ptr_array_add(args, g_strdup(dest));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -194,8 +207,6 @@ static gboolean casync_extract(RaucImage *image, gchar *dest, const gchar *seed,
 	}
 
 out:
-	g_ptr_array_unref(args);
-	g_clear_pointer(&sproc, g_object_unref);
 	return res;
 }
 
@@ -224,7 +235,7 @@ static gboolean casync_extract_image(RaucImage *image, gchar *dest, GError **err
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 	RaucSlot *seedslot = NULL;
-	gchar *seed = NULL;
+	g_autofree gchar *seed = NULL;
 	gchar *store = NULL;
 	gboolean seed_mounted = FALSE;
 
@@ -258,10 +269,11 @@ static gboolean casync_extract_image(RaucImage *image, gchar *dest, GError **err
 		seed = g_strdup(seedslot->device);
 	}
 
+extract:
+	/* Set store */
 	store = r_context()->install_info->mounted_bundle->storepath;
 	g_debug("Using store path: '%s'", store);
 
-extract:
 	/* Call casync to extract */
 	res = casync_extract(image, dest, seed, store, &ierror);
 	if (!res) {
@@ -271,7 +283,7 @@ extract:
 
 	/* Cleanup seed */
 	if (seed_mounted) {
-		r_umount_slot(seedslot, &ierror);
+		res = r_umount_slot(seedslot, &ierror);
 		if (!res) {
 			g_propagate_prefixed_error(error, ierror, "Failed unmounting seed slot: ");
 			goto out;
@@ -285,7 +297,7 @@ out:
 
 static gboolean copy_raw_image_to_dev(RaucImage *image, RaucSlot *slot, GError **error)
 {
-	GOutputStream *outstream = NULL;
+	g_autoptr(GUnixOutputStream) outstream = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 
@@ -307,7 +319,6 @@ static gboolean copy_raw_image_to_dev(RaucImage *image, RaucSlot *slot, GError *
 	}
 
 out:
-	g_clear_object(&outstream);
 	return res;
 }
 
@@ -341,16 +352,17 @@ out:
 
 static gboolean ubifs_format_slot(RaucSlot *dest_slot, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(3, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(3, g_free);
 
 	g_ptr_array_add(args, g_strdup("mkfs.ubifs"));
 	g_ptr_array_add(args, g_strdup("-y"));
 	g_ptr_array_add(args, g_strdup(dest_slot->device));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -371,17 +383,15 @@ static gboolean ubifs_format_slot(RaucSlot *dest_slot, GError **error)
 	}
 
 out:
-	g_ptr_array_unref(args);
-	g_clear_pointer(&sproc, g_object_unref);
 	return res;
 }
 
 static gboolean ext4_format_slot(RaucSlot *dest_slot, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(4, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(4, g_free);
 
 	g_ptr_array_add(args, g_strdup("mkfs.ext4"));
 	g_ptr_array_add(args, g_strdup("-F"));
@@ -392,6 +402,7 @@ static gboolean ext4_format_slot(RaucSlot *dest_slot, GError **error)
 	g_ptr_array_add(args, g_strdup(dest_slot->device));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -412,17 +423,15 @@ static gboolean ext4_format_slot(RaucSlot *dest_slot, GError **error)
 	}
 
 out:
-	g_ptr_array_unref(args);
-	g_clear_pointer(&sproc, g_object_unref);
 	return res;
 }
 
 static gboolean vfat_format_slot(RaucSlot *dest_slot, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(4, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(4, g_free);
 
 	g_ptr_array_add(args, g_strdup("mkfs.vfat"));
 	if (strlen(dest_slot->name) <= 16) {
@@ -432,6 +441,7 @@ static gboolean vfat_format_slot(RaucSlot *dest_slot, GError **error)
 	g_ptr_array_add(args, g_strdup(dest_slot->device));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -452,17 +462,15 @@ static gboolean vfat_format_slot(RaucSlot *dest_slot, GError **error)
 	}
 
 out:
-	g_ptr_array_unref(args);
-	g_clear_pointer(&sproc, g_object_unref);
 	return res;
 }
 
 static gboolean nand_format_slot(const gchar *device, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(5, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(5, g_free);
 
 	g_ptr_array_add(args, g_strdup("flash_erase"));
 	g_ptr_array_add(args, g_strdup("--quiet"));
@@ -471,6 +479,7 @@ static gboolean nand_format_slot(const gchar *device, GError **error)
 	g_ptr_array_add(args, g_strdup("0"));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -491,17 +500,15 @@ static gboolean nand_format_slot(const gchar *device, GError **error)
 	}
 
 out:
-	g_ptr_array_unref(args);
-	g_clear_pointer(&sproc, g_object_unref);
 	return res;
 }
 
 static gboolean nand_write_slot(const gchar *image, const gchar *device, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(5, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(5, g_free);
 
 	g_ptr_array_add(args, g_strdup("nandwrite"));
 	g_ptr_array_add(args, g_strdup("--pad"));
@@ -510,6 +517,7 @@ static gboolean nand_write_slot(const gchar *image, const gchar *device, GError 
 	g_ptr_array_add(args, g_strdup(image));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -530,25 +538,25 @@ static gboolean nand_write_slot(const gchar *image, const gchar *device, GError 
 	}
 
 out:
-	g_ptr_array_unref(args);
-	g_clear_pointer(&sproc, g_object_unref);
 	return res;
 }
 
 static gboolean untar_image(RaucImage *image, gchar *dest, GError **error)
 {
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
-	GPtrArray *args = g_ptr_array_new_full(5, g_free);
+	g_autoptr(GPtrArray) args = g_ptr_array_new_full(5, g_free);
 
 	g_ptr_array_add(args, g_strdup("tar"));
 	g_ptr_array_add(args, g_strdup("xf"));
 	g_ptr_array_add(args, g_strdup(image->filename));
 	g_ptr_array_add(args, g_strdup("-C"));
 	g_ptr_array_add(args, g_strdup(dest));
+	g_ptr_array_add(args, g_strdup("--numeric-owner"));
 	g_ptr_array_add(args, NULL);
 
+	r_debug_subprocess(args);
 	sproc = g_subprocess_newv((const gchar * const *)args->pdata,
 			G_SUBPROCESS_FLAGS_NONE, &ierror);
 	if (sproc == NULL) {
@@ -569,8 +577,6 @@ static gboolean untar_image(RaucImage *image, gchar *dest, GError **error)
 	}
 
 out:
-	g_ptr_array_unref(args);
-	g_clear_pointer(&sproc, g_object_unref);
 	return res;
 }
 
@@ -597,8 +603,8 @@ static gboolean unpack_archive(RaucImage *image, gchar *dest, GError **error)
  */
 static gboolean run_slot_hook(const gchar *hook_name, const gchar *hook_cmd, RaucImage *image, RaucSlot *slot, GError **error)
 {
-	GSubprocessLauncher *launcher = NULL;
-	GSubprocess *sproc = NULL;
+	g_autoptr(GSubprocessLauncher) launcher = NULL;
+	g_autoptr(GSubprocess) sproc = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 
@@ -612,6 +618,7 @@ static gboolean run_slot_hook(const gchar *hook_name, const gchar *hook_cmd, Rau
 
 	g_subprocess_launcher_setenv(launcher, "RAUC_SLOT_NAME", slot->name, TRUE);
 	g_subprocess_launcher_setenv(launcher, "RAUC_SLOT_CLASS", slot->sclass, TRUE);
+	g_subprocess_launcher_setenv(launcher, "RAUC_SLOT_TYPE", slot->type, TRUE);
 	g_subprocess_launcher_setenv(launcher, "RAUC_SLOT_DEVICE", slot->device, TRUE);
 	g_subprocess_launcher_setenv(launcher, "RAUC_SLOT_BOOTNAME", slot->bootname ?: "", TRUE);
 	g_subprocess_launcher_setenv(launcher, "RAUC_SLOT_PARENT", slot->parent ? slot->parent->name : "", TRUE);
@@ -660,8 +667,6 @@ static gboolean run_slot_hook(const gchar *hook_name, const gchar *hook_cmd, Rau
 	}
 
 out:
-	g_clear_pointer(&launcher, g_object_unref);
-	g_clear_pointer(&sproc, g_object_unref);
 	return res;
 }
 
@@ -670,6 +675,7 @@ static gboolean mount_and_run_slot_hook(const gchar *hook_name, const gchar *hoo
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 
+	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 	g_assert_nonnull(hook_name);
 	g_assert_nonnull(hook_cmd);
 
@@ -692,7 +698,7 @@ static gboolean mount_and_run_slot_hook(const gchar *hook_name, const gchar *hoo
 	g_message("Unmounting slot %s", slot->device);
 	if (!r_umount_slot(slot, &ierror)) {
 		res = FALSE;
-		if (error) {
+		if (error && *error) {
 			/* the slot hook error is more relevant here */
 			g_warning("Ignoring umount error after slot hook error: %s", ierror->message);
 			g_clear_error(&ierror);
@@ -707,7 +713,7 @@ out:
 
 static gboolean img_to_ubivol_handler(RaucImage *image, RaucSlot *dest_slot, const gchar *hook_name, GError **error)
 {
-	GOutputStream *outstream = NULL;
+	g_autoptr(GUnixOutputStream) outstream = NULL;
 	GError *ierror = NULL;
 	int out_fd;
 	gboolean res = FALSE;
@@ -754,13 +760,12 @@ static gboolean img_to_ubivol_handler(RaucImage *image, RaucSlot *dest_slot, con
 	}
 
 out:
-	g_clear_object(&outstream);
 	return res;
 }
 
 static gboolean img_to_ubifs_handler(RaucImage *image, RaucSlot *dest_slot, const gchar *hook_name, GError **error)
 {
-	GOutputStream *outstream = NULL;
+	g_autoptr(GUnixOutputStream) outstream = NULL;
 	GError *ierror = NULL;
 	int out_fd;
 	gboolean res = FALSE;
@@ -807,7 +812,6 @@ static gboolean img_to_ubifs_handler(RaucImage *image, RaucSlot *dest_slot, cons
 	}
 
 out:
-	g_clear_object(&outstream);
 	return res;
 }
 
@@ -815,6 +819,8 @@ static gboolean archive_to_ubifs_handler(RaucImage *image, RaucSlot *dest_slot, 
 {
 	GError *ierror = NULL;
 	gboolean res = FALSE;
+
+	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	/* run slot pre install hook if enabled */
 	if (hook_name && image->hooks.pre_install) {
@@ -863,7 +869,7 @@ unmount_out:
 	g_message("Unmounting ubifs slot %s", dest_slot->device);
 	if (!r_umount_slot(dest_slot, &ierror)) {
 		res = FALSE;
-		if (error) {
+		if (error && *error) {
 			/* the previous error is more relevant here */
 			g_warning("Ignoring umount error after previous error: %s", ierror->message);
 			g_clear_error(&ierror);
@@ -880,6 +886,8 @@ static gboolean archive_to_ext4_handler(RaucImage *image, RaucSlot *dest_slot, c
 {
 	GError *ierror = NULL;
 	gboolean res = FALSE;
+
+	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	/* run slot pre install hook if enabled */
 	if (hook_name && image->hooks.pre_install) {
@@ -928,7 +936,7 @@ unmount_out:
 	g_message("Unmounting ext4 slot %s", dest_slot->device);
 	if (!r_umount_slot(dest_slot, &ierror)) {
 		res = FALSE;
-		if (error) {
+		if (error && *error) {
 			/* the previous error is more relevant here */
 			g_warning("Ignoring umount error after previous error: %s", ierror->message);
 			g_clear_error(&ierror);
@@ -945,6 +953,8 @@ static gboolean archive_to_vfat_handler(RaucImage *image, RaucSlot *dest_slot, c
 {
 	GError *ierror = NULL;
 	gboolean res = FALSE;
+
+	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	/* run slot pre install hook if enabled */
 	if (hook_name && image->hooks.pre_install) {
@@ -993,7 +1003,7 @@ unmount_out:
 	g_message("Unmounting vfat slot %s", dest_slot->device);
 	if (!r_umount_slot(dest_slot, &ierror)) {
 		res = FALSE;
-		if (error) {
+		if (error && *error) {
 			/* the previous error is more relevant here */
 			g_warning("Ignoring umount error after previous error: %s", ierror->message);
 			g_clear_error(&ierror);
@@ -1051,7 +1061,6 @@ out:
 
 static gboolean img_to_fs_handler(RaucImage *image, RaucSlot *dest_slot, const gchar *hook_name, GError **error)
 {
-	GOutputStream *outstream = NULL;
 	GError *ierror = NULL;
 	gboolean res = FALSE;
 
@@ -1081,21 +1090,21 @@ static gboolean img_to_fs_handler(RaucImage *image, RaucSlot *dest_slot, const g
 	}
 
 out:
-	g_clear_object(&outstream);
 	return res;
 }
 
+#if ENABLE_EMMC_BOOT_SUPPORT == 1
 static gboolean img_to_boot_emmc_handler(RaucImage *image, RaucSlot *dest_slot, const gchar *hook_name, GError **error)
 {
 
 	gboolean res = FALSE;
 	int out_fd;
 	gint part_active;
-	gchar *part_active_str = NULL;
+	g_autofree gchar *part_active_str = NULL;
 	gint part_active_after;
-	GOutputStream *outstream = NULL;
+	g_autoptr(GUnixOutputStream) outstream = NULL;
 	GError *ierror = NULL;
-	RaucSlot *part_slot = NULL;
+	g_autoptr(RaucSlot) part_slot = NULL;
 
 	/* run slot pre install hook if enabled */
 	if (hook_name && image->hooks.pre_install) {
@@ -1239,12 +1248,9 @@ out:
 	if (!res && part_slot)
 		r_emmc_force_part_ro(part_slot->device, NULL);
 
-	g_clear_object(&outstream);
-	g_clear_pointer(&part_slot, r_free_slot);
-	g_free(part_active_str);
-
 	return res;
 }
+#endif
 
 static gboolean img_to_raw_handler(RaucImage *image, RaucSlot *dest_slot, const gchar *hook_name, GError **error)
 {
@@ -1319,6 +1325,7 @@ RaucUpdatePair updatepairs[] = {
 	{"*.ext4", "ext4", img_to_fs_handler},
 	{"*.ext4", "raw", img_to_raw_handler},
 	{"*.vfat", "raw", img_to_raw_handler},
+	{"*.squashfs", "raw", img_to_raw_handler},
 	{"*.vfat", "vfat", img_to_fs_handler},
 	{"*.tar*", "ext4", archive_to_ext4_handler},
 	{"*.catar", "ext4", archive_to_ext4_handler},
@@ -1326,10 +1333,15 @@ RaucUpdatePair updatepairs[] = {
 	{"*.tar*", "vfat", archive_to_vfat_handler},
 	{"*.ubifs", "ubivol", img_to_ubivol_handler},
 	{"*.ubifs", "ubifs", img_to_ubifs_handler},
+	{"*.img", "ext4", img_to_fs_handler},
 	{"*.img", "nand", img_to_nand_handler},
+	{"*.img", "ubifs", img_to_ubifs_handler},
 	{"*.img", "ubivol", img_to_ubivol_handler},
+	{"*.img", "vfat", img_to_fs_handler},
 	{"*.squashfs", "ubivol", img_to_ubivol_handler},
+#if ENABLE_EMMC_BOOT_SUPPORT == 1
 	{"*.img", "boot-emmc", img_to_boot_emmc_handler},
+#endif
 	{"*.img", "*", img_to_raw_handler}, /* fallback */
 	{0}
 };

@@ -31,7 +31,7 @@ sub-command:
 
 .. code-block:: sh
 
-  rauc bundle --cert=<certfile> --key=<keyfile> <input-dir> <output-file>
+  rauc bundle --cert=<certfile> --key=<keyfile> --keyring=<keyringfile> <input-dir> <output-file>
 
 Where ``<input-dir>`` must be a directory containing all images and scripts the
 bundle should include, as well as a manifest file ``manifest.raucm`` that
@@ -40,6 +40,18 @@ which image to install to which slot, which scripts to execute etc.
 ``<output-file>`` must be the path of the bundle file to create. Note that RAUC
 bundles must always have a ``.raucb`` file name suffix in order to ensure that
 RAUC treats them as bundles.
+
+Instead of the ``certfile`` and ``keyfile`` arguments, PKCS#11 URLs such as
+``'pkcs11:token=rauc;object=autobuilder-1'`` can be used to avoid storing
+sensitive key material as files (see :ref:`PKCS#11 Support <pkcs11-support>`
+for details).
+
+While the ``--cert`` and ``--key`` argument are mandatory for signing and must
+provide the certificate and private key that should be used for creating the
+signature, the ``--keyring`` argument is optional and (if given) will be used
+for verifying the trust chain validity of the signature after creation.
+Note that this is very useful to prevent from signing with obsolete
+certificates, etc.
 
 Obtaining Bundle Information
 ----------------------------
@@ -113,7 +125,7 @@ that to the underlying bootloader implementation. In most cases this will
 disable the currently booted slot or at least switch to a different one.
 
 Although not very useful in the field, both commands recognize an optional
-argument to explicitely identify the slot to act on:
+argument to explicitly identify the slot to act on:
 
 .. code-block:: sh
 
@@ -134,7 +146,7 @@ boot by hand, for example:
 * Recurrently test the installation of a bundle in development starting from a
   known state.
 * Activate a slot that has been installed sometime before and whose activation
-  has explicitely been prevented at that time using the system configuration
+  has explicitly been prevented at that time using the system configuration
   file's parameter :ref:`activate-installed <activate-installed>`.
 * Switch back to the previous slot because one really knows |better (TM)|.
 
@@ -151,7 +163,7 @@ To do so, RAUC offers the subcommand
 where the optional argument decides which slot to (re-)activate at the expense
 of the remaining slots. Choosing ``other`` switches to the next bootable slot
 that is not the one that is currently booted. In a two-slot-setup this is
-just... the other one. If one wants to explicitely address a known slot, one can
+just... the other one. If one wants to explicitly address a known slot, one can
 do so by using its slot name which has the form ``<slot-class>.<idx>`` (e.g.
 ``rootfs.1``), see :ref:`this <slot.slot-class.idx-section>` part of section
 :ref:`System Configuration File <sec_ref_slot_config>`. Last but not least,
@@ -362,6 +374,9 @@ The following environment variables will be passed to the hook executable:
   ``RAUC_SLOT_CLASS``
     The class of the currently installed slot
 
+  ``RAUC_SLOT_TYPE``
+    The type of the currently installed slot
+
   ``RAUC_SLOT_DEVICE``
     The device of the currently installed slot
 
@@ -476,7 +491,7 @@ infrastructure for executing an application or a script on the target side.
 For this case, you may replace the entire default installation handler of rauc
 by a custom handler script or application.
 
-Refer system.conf :ref:`[handler] <sec-manifest-handler>` section description
+Refer manifest :ref:`[handler] <sec-manifest-handler>` section description
 on how to achieve this.
 
 
@@ -577,3 +592,88 @@ Monitor the D-Bus interface
 .. code-block:: sh
 
   busctl monitor de.pengutronix.rauc
+
+.. _debugging:
+
+Debugging RAUC
+==============
+
+When RAUC fails to start on your target during integration or later during
+installation of new bundles it can have a variety of causes.
+
+This section will lead you trough the most common options you have for
+debugging what actually went wrong.
+
+In each case it is quite essential to know that RAUC, if not compiled with
+``--disable-service`` runs as a service on your target that is either
+controlled by your custom application or by the RAUC command line interface.
+
+The frontend will always only show the 'high level' error outpt, e.g. when an
+installation failed:
+
+.. code-block:: sh
+
+  rauc-Message: 08:27:12.083: installing /home/enrico/Code/rauc/good-bundle-hook.raucb: LastError: Failed mounting bundle: failed to run mount: Child process exited with code 1
+  rauc-Message: 08:27:12.083: installing /home/enrico/Code/rauc/good-bundle-hook.raucb: idle
+  Installing `/home/enrico/Code/rauc/good-bundle-hook.raucb` failed
+
+In simple cases this might be sufficient for identifying the actual problem, in
+more complicated cases this may give a rough hint.
+For a more detailed look on what went wrong you need to inspect the rauc
+service log instead.
+
+If you run RAUC using systemd, the log can be obtained using
+
+.. code-block:: sh
+
+  journalctl -u rauc
+
+When using SysVInit, your service script needs to configure logging itself.
+A common way is to dump the log e.g. /var/log/rauc.
+
+It may also be worth starting the RAUC service via command line on a second
+shell to have a live view of what is going on when you invoke e.g. ``rauc
+install`` on the first shell.
+
+Increasing Debug Verbosity
+--------------------------
+
+Both for the service and the command line interface it is often useful to
+increase the log level for narrowing down the actual error cause or gaining
+more information about the circumstances when the error occurs.
+
+RAUC uses glib and the
+`glib logging framework <https://developer.gnome.org/programming-guidelines/stable/logging.html.en>`_ with the basic log domain 'rauc'.
+
+For simple cases, you can activate logging by passing the ``-d`` or ``--debug`` option to either the CLI:
+
+.. code-block:: sh
+
+  rauc install -d bundle.raucb ..
+
+or the service (you might need to modify your systemd or SysVInit
+service file).
+
+.. code-block:: sh
+
+  rauc service -d
+
+For more fine grained and advanced debugging options, use the
+``G_MESSAGES_DEBUG`` environment variable.
+This allows enabling different log domains. Currently available are:
+
+:all: enable all log domains
+
+:rauc: enable default RAUC log domain (same as calling with ``-d``)
+
+:rauc-subprocess: enable logging of subprocess calls
+
+  This will dump the entire program call invoked by RAUC and can help tracing
+  down or reproducing issues caused by other programs invoked.
+
+Example invocation:
+
+.. code-block:: sh
+
+  G_MESSAGES_DEBUG="rauc rauc-subprocess" rauc service
+

@@ -59,6 +59,22 @@
     <!-- Progress: Provides installation progress informations in the form
          (percentage, message, nesting depth) -->
     <property name="Progress" type="(isi)" access="read"/>
+    <!-- Compatible: Represents the system's compatible -->
+    <property name="Compatible" type="s" access="read"/>
+    <!-- Variant: Represents the system's variant -->
+    <property name="Variant" type="s" access="read"/>
+    <!-- BootSlot: Represents the slot booted from -->
+    <property name="BootSlot" type="s" access="read"/>
+    <!--
+         GetPrimary:
+         @slot_status_array: array of (slotname, dict) tuples with each
+             dictionary representing the status of the corresponding slot
+
+         Call the bootloader interface to get the primary boot slot
+    -->
+    <method name="GetPrimary">
+      <arg name="primary" type="s" direction="out"/>
+    </method>
 
     <!--
          Completed:

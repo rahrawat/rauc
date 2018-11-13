@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <ftw.h>
 #include <gio/gio.h>
 #include <glib.h>
@@ -47,23 +48,16 @@ gboolean copy_file(const gchar *srcprefix, const gchar *srcfile,
 {
 	gboolean res = FALSE;
 	GError *ierror = NULL;
-	gchar *srcpath = g_build_filename(srcprefix, srcfile, NULL);
-	gchar *dstpath = g_build_filename(dstprefix, dstfile, NULL);
-	GFile *src = g_file_new_for_path(srcpath);
-	GFile *dst = g_file_new_for_path(dstpath);
+	g_autofree gchar *srcpath = g_build_filename(srcprefix, srcfile, NULL);
+	g_autofree gchar *dstpath = g_build_filename(dstprefix, dstfile, NULL);
+	g_autoptr(GFile) src = g_file_new_for_path(srcpath);
+	g_autoptr(GFile) dst = g_file_new_for_path(dstpath);
 
 	res = g_file_copy(src, dst, G_FILE_COPY_NONE, NULL, NULL, NULL,
 			&ierror);
-	if (!res) {
+	if (!res)
 		g_propagate_error(error, ierror);
-		goto out;
-	}
 
-out:
-	g_object_unref(src);
-	g_object_unref(dst);
-	g_clear_pointer(&srcpath, g_free);
-	g_clear_pointer(&dstpath, g_free);
 	return res;
 }
 
@@ -91,7 +85,7 @@ gboolean rm_tree(const gchar *path, GError **error)
 	g_return_val_if_fail(path[0] == '/', FALSE);
 
 	if (nftw(path, &rm_tree_cb, 20, flags)) {
-		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED, "failed to remove tree at %s", path);
+		g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_FAILED, "failed to remove tree at %s: %s", path, g_strerror(errno));
 		return FALSE;
 	}
 
@@ -101,7 +95,9 @@ gboolean rm_tree(const gchar *path, GError **error)
 
 gchar *resolve_path(const gchar *basefile, gchar *path)
 {
-	gchar *cwd = NULL, *dir = NULL, *res = NULL;
+	g_autofree gchar *cwd = NULL;
+	g_autofree gchar *dir = NULL;
+	g_autofree gchar *res = NULL;
 
 	if (path == NULL)
 		return NULL;
@@ -110,17 +106,68 @@ gchar *resolve_path(const gchar *basefile, gchar *path)
 		return path;
 
 	dir = g_path_get_dirname(basefile);
-	if (g_path_is_absolute(dir)) {
-		res = g_build_filename(dir, path, NULL);
-		goto out;
-	}
+	if (g_path_is_absolute(dir))
+		return g_build_filename(dir, path, NULL);
 
 	cwd = g_get_current_dir();
-	res = g_build_filename(cwd, dir, path, NULL);
-
-out:
-	g_clear_pointer(&cwd, g_free);
-	g_clear_pointer(&dir, g_free);
-	g_clear_pointer(&path, g_free);
-	return res;
+	return g_build_filename(cwd, dir, path, NULL);
 }
+
+gboolean check_remaining_groups(GKeyFile *key_file, GError **error)
+{
+	gsize rem_num_groups;
+	gchar **rem_groups;
+
+	rem_groups = g_key_file_get_groups(key_file, &rem_num_groups);
+	if (rem_num_groups != 0) {
+		g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_PARSE,
+				"Invalid group '[%s]'", rem_groups[0]);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+gboolean check_remaining_keys(GKeyFile *key_file, const gchar *groupname, GError **error)
+{
+	gsize rem_num_keys;
+	gchar **rem_keys;
+
+	rem_keys = g_key_file_get_keys(key_file, groupname, &rem_num_keys, NULL);
+	if (rem_keys && rem_num_keys != 0) {
+		g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_PARSE,
+				"Invalid key '%s' in group '[%s]'", rem_keys[0],
+				groupname);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/* get string argument from key and remove key from key_file */
+gchar * key_file_consume_string(
+		GKeyFile *key_file,
+		const gchar *group_name,
+		const gchar *key,
+		GError **error)
+{
+	gchar *result = NULL;
+	GError *ierror = NULL;
+
+	result = g_key_file_get_string(key_file, group_name, key, &ierror);
+	if (!result) {
+		g_propagate_error(error, ierror);
+		return NULL;
+	}
+
+	g_key_file_remove_key(key_file, group_name, key, NULL);
+
+	if (result[0] == '\0') {
+		g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_PARSE,
+				"Missing value for key '%s'", key);
+		return NULL;
+	}
+
+	return result;
+}
+

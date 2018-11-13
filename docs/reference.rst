@@ -17,6 +17,9 @@ Each board type requires its special configuration.
 
 This file is part of the root file system.
 
+.. note:: When changing the configuration file on your running target you need
+  to restart the RAUC service in order to let the changes take effect.
+
 Example configuration:
 
 .. code-block:: cfg
@@ -42,6 +45,7 @@ Example configuration:
   type=ext4
   bootname=system1
 
+.. _system-section:
 
 **[system] section**
 
@@ -87,6 +91,13 @@ Example configuration:
   key not exists, the bootchooser framework searches per default for ``/state``
   or ``/aliases/state``.
 
+``max-bundle-download-size``
+  Defines the maximum downloadable bundle size in bytes, and thus must be
+  a simple integer value (without unit) greater than zero.
+  It overwrites the compiled-in default value of 8 MiB.
+
+.. _keyring-section:
+
 **[keyring] section**
 
 The ``keyring`` section refers to the trusted keyring used for signature
@@ -95,6 +106,10 @@ verification.
 ``path``
   Path to the keyring file in PEM format. Either absolute or relative to the
   system.conf file.
+
+``use-bundle-signing-time``
+  Use the bundle signing time instead of current time for certificate
+  validation.
 
 **[casync] section**
 
@@ -172,12 +187,13 @@ set of slots. It must not contain any `.` (dots) as these are used as
 hierarchical separator.
 
 ``device``
-  The slot's device path.
+  The slot's device path. This one is mandatory.
 
 ``type``
   The type describing the slot. Currently supported values are ``raw``,
   ``nand``, ``ubivol``, ``ubifs``, ``ext4``, ``vfat``.
   See table :ref:`sec-slot-type` for a more detailed list of these different types.
+  Defaults to ``raw`` if none given.
 
 ``bootname``
   For bootable slots, the name the bootloader uses to identify it. The real
@@ -194,11 +210,16 @@ hierarchical separator.
   Marks the slot as existing but not updatable. May be used for sanity checking
   or informative purpose. A ``readonly`` slot cannot be a target slot.
 
-``ignore-checksum``
+``force-install-same``
   If set to ``true`` this will bypass the default hash comparison for this slot
   and force RAUC to unconditionally update it. The default value is ``false``,
   which means that updating this slot will be skipped if new image's hash
   matches hash of installed one.
+  This replaces the deprecated entry ``ignore-checksum``.
+
+``extra-mount-opts``
+  Allows to specify custom mount options that will be passed to the slots
+  ``mount`` call as ``-o`` argument value.
 
 .. _sec_ref_manifest:
 
@@ -274,8 +295,12 @@ A valid manifest file must have the file extension ``.raucm``.
 
 **[image.<slot-class>] section**
 
+.. _image.slot-filename:
+
 ``filename``
   Name of the image file (relative to bundle content).
+  RAUC uses the file extension and the slot type to decide how to extract the
+  image file content to the slot.
 
 ``sha256``
   sha256 of image file. RAUC determines this value automatically when creating
@@ -327,9 +352,9 @@ termed with the slot name (e.g. [slot.rootfs.1]) for the central status file:
 For a description of ``sha256`` and ``size`` keys see :ref:`this
 <image.slot-class-section>` part of the section :ref:`Manifest
 <sec_ref_manifest>`.
-Having the slot's content's size allows to re-calculate the hash via `head -c
+Having the slot's content's size allows to re-calculate the hash via ``head -c
 <size> <slot-device> | sha256sum` or `dd bs=<size> count=1 if=<slot-device> |
-sha256sum`.
+sha256sum``.
 
 The properties ``bundle.compatible``, ``bundle.version``, ``bundle.description``
 and ``bundle.build`` are copies of the respective manifest properties.
@@ -356,8 +381,8 @@ Command Line Tool
 
   Options:
     -c, --conf=FILENAME               config file
-    --cert=PEMFILE                    cert file
-    --key=PEMFILE                     key file
+    --cert=PEMFILE|PKCS11-URL         cert file or PKCS#11 URL
+    --key=PEMFILE|PKCS11-URL          key file or PKCS#11 URL
     --keyring=PEMFILE                 keyring file
     --intermediate=PEMFILE            intermediate CA file name
     --mount=PATH                      mount prefix
@@ -375,6 +400,9 @@ Command Line Tool
     info          Show file information
     status        Show status
 
+  Environment variables:
+    RAUC_PKCS11_MODULE  Library filename for PKCS#11 module (signing only)
+    RAUC_PKCS11_PIN     PIN to use for accessing PKCS#11 keys (signing only)
 
 .. _sec-handler-interface:
 
@@ -414,6 +442,9 @@ variables.
 
   ``RAUC_SLOT_CLASS_<N>``
     The class of slot number <N>, e.g. ``rootfs``
+
+  ``RAUC_SLOT_TYPE_<N>``
+    The type of slot number <N>, e.g. ``raw``
 
   ``RAUC_SLOT_DEVICE_<N>``
     The device path of slot number <N>, e.g. ``/dev/sda1``
@@ -464,6 +495,12 @@ Properties
 :ref:`LastError <gdbus-property-de-pengutronix-rauc-Installer.LastError>` readable   s
 
 :ref:`Progress <gdbus-property-de-pengutronix-rauc-Installer.Progress>` readable   (isi)
+
+:ref:`Compatible <gdbus-property-de-pengutronix-rauc-Installer.Compatible>` readable   s
+
+:ref:`Variant <gdbus-property-de-pengutronix-rauc-Installer.Variant>` readable   s
+
+:ref:`BootSlot <gdbus-property-de-pengutronix-rauc-Installer.BootSlot>` readable   s
 
 Description
 ~~~~~~~~~~~
@@ -520,7 +557,7 @@ The Mark() Method
   Mark (IN  s state, IN  s slot_identifier, s slot_name, s message);
 
 Keeps a slot bootable (state == "good"), makes it unbootable (state == "bad")
-or explicitely activates it for the next boot (state == "active").
+or explicitly activates it for the next boot (state == "active").
 
 IN s *state*:
     Operation to perform (one out of "good", "bad" or "active")
@@ -595,7 +632,7 @@ The "LastError" Property
   de.pengutronix.rauc.Installer:LastError
   LastError  readable   s
 
-Holds the last message of the last error that occured.
+Holds the last message of the last error that occurred.
 
 .. _gdbus-property-de-pengutronix-rauc-Installer.Progress:
 
@@ -607,9 +644,48 @@ The "Progress" Property
   de.pengutronix.rauc.Installer:Progress
   Progress  readable   (isi)
 
-Provides installation progress informations in the form
+Provides installation progress information in the form
 
 (percentage, message, nesting depth)
+
+.. _gdbus-property-de-pengutronix-rauc-Installer.Compatible:
+
+The "Compatible" Property
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code::
+
+  de.pengutronix.rauc.Installer:Compatible
+  Compatible  readable   s
+
+Represents the system's compatible. This can be used to check for usable bundels.
+
+
+.. _gdbus-property-de-pengutronix-rauc-Installer.Variant:
+
+The "Variant" Property
+^^^^^^^^^^^^^^^^^^^^^^
+
+.. code::
+
+  de.pengutronix.rauc.Installer:Variant
+  Variant  readable   s
+
+Represents the system's variant. This can be used to select parts of an bundle.
+
+
+.. _gdbus-property-de-pengutronix-rauc-Installer.BootSlot:
+
+The "BootSlot" Property
+^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code::
+
+  de.pengutronix.rauc.Installer:BootSlot
+  BootSlot  readable   s
+
+Represents the used boot slot.
+
 
 RAUC's Basic Update Procedure
 -----------------------------
@@ -643,3 +719,142 @@ Performing an update using the default RAUC mechanism will work as follows:
 
 #. Unmount bundle
 #. Terminate successfully if no error occurred
+
+.. _bootloader-interaction:
+
+Bootloader Interaction
+----------------------
+
+RAUC comes with a generic interface for interacting with the bootloader.
+
+It provides two base functions:
+
+1) Setting state 'good' or 'bad', reflected by API routine `r_boot_set_state()`
+   and command line tool option `rauc status mark <good/bad>`
+2) Marking a slot 'primary', reflected by API routine `r_boot_set_primary()`
+   and command line tool option `rauc status mark-active`
+
+The default flow of how they will be called during the installation of a new
+bundle (on Slot 'A') looks as follows::
+
+  start   ->  install  ->  reboot  -> operating state  ->
+          |            |                               |
+     set A bad   set A primary                     set A good/bad
+
+The aim of setting state 'bad' is to disable a slot in a way that the
+bootloader will not select it for booting anymore.
+As shown above this is either the case before an installation to make the
+update atomic from the bootloader's perspective, or optionally after the
+installation and a reboot into the new system, when a service detects that the
+system is in an unusable state. This potentially allows falling back to a
+working system.
+
+The aim of setting a slot 'primary' is to let the bootloader select this slot
+upon next reboot in case of having completed the installation successfully.
+An alternative to directly marking a slot primary after installation is to
+manually mark it primary at a later point in time, e.g. to let a complete set
+of devices change their software revision at the same time.
+
+Setting the slot 'good' is relevant for the first boot but for all subsequent
+boots, too.
+In most cases, this interaction with the bootloader is required by the
+mechanism that enables fallback capability; rebooting a system one or several times
+without calling `rauc status mark-good` will
+let the bootloader boot an alternative system or abort boot operation
+(depending on configuration).
+Usually, bootloaders implement this fallback mechanism by some kind of counters
+they maintain and decrease upon each boot.
+In these cases *marking good* means resetting these counters.
+
+A normal reboot of the system will look as follows::
+
+  operating state  ->  reboot  -> operating state  ->
+                                                   |
+                                             set A good/bad
+
+Some bootloaders do not require explicitly setting state 'good' as they are able
+to differentiate between a POR and a watchdog reset, for example.
+
+.. note: Despite the naming might suggest it, marking a slot bad and good are
+  not reversible operations, meaning you have no guarantee that a slot first
+  set to 'bad' and then set to 'good' again will be in the same state as
+  before.
+  Actually reactivating it will only work by marking it primary (active).
+
+What the high-level functions described above actually do mainly depends on the underlying
+bootloader used and the capabilities it provides.
+Below is a short description about behavior of each bootloader interface
+currently implemented:
+
+U-Boot
+~~~~~~
+
+The U-Boot implementation assumes to have variables `BOOT_ORDER` and
+`BOOT_x_ATTEMPTS` handled by the bootloader scripting.
+
+:state bad:
+  Sets the `BOOT_x_ATTEMPTS` variable of the slot to `0` and removes it from
+  the `BOOT_ORDER` list
+
+:state good:
+  Sets the `BOOT_x_ATTEMPTS` variable back to its default value (`3`).
+
+:primary:
+  Moves the slot from its current position in the list in `BOOT_ORDER` to the
+  first place and sets `BOOT_x_ATTEMPTS` to its initial value (`3`).
+  If BOOT_ORDER was unset before, it generates a new list of all slots known to
+  RAUC with the one to activate at the first position.
+
+
+Barebox
+~~~~~~~
+
+The barebox implementation assumes using
+`barebox bootchooser <https://barebox.org/doc/latest/user/bootchooser.html>`_.
+
+:state bad:
+  Sets both the `bootstate.systemX.priority` and
+  `bootstate.systemX.remaining_attempts` to `0`.
+
+:state good:
+  Sets the `bootstate.systemX.remaining_attempts` to its default value
+  (`3`).
+
+:primary:
+  Sets `bootstate.systemX.priority` to `20` and all other priorities that were
+  non-zero before to `10`.
+  It also sets `bootstate.systemX.remaining_attempts` to its initial value (`3`).
+
+GRUB
+~~~~
+
+:state bad:
+  Sets slot `x_OK` to `0` and resets `x_TRY` to `0`.
+
+:state good:
+  Sets slot `x_OK` to `1` and resets `x_TRY` to `0`.
+
+:primary:
+  Sets slot `x_OK` to `1` and resets `x_TRY` to `0`.
+  Sets `ORDER` to contain slot ``x`` as first element and all other after.
+
+EFI
+~~~
+
+:state bad:
+  Removes the slot from `BootOrder`
+
+:state good:
+  Prepends the slot to the `BootOrder` list.
+  This behaves slightly different than the other implementations because we use
+  `BootNext` for allowing setting primary with an initial fallback option.
+  Setting state good is then used to persist this.
+
+:primary:
+  Sets the slot as `BootNext`.
+  This will make the slot being booted upon next reboot only!
+
+.. note:: EFI implementations differ in how they handle new or unbootable
+  targets etc. It may also depend on the actual implementation if EFI variable
+  writing is atomic or not.
+  Thus make sure your EFI works as expected and required.

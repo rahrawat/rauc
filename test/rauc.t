@@ -4,6 +4,16 @@ test_description="rauc binary tests"
 
 . ./sharness.sh
 
+export G_DEBUG="fatal-criticals"
+
+CA_DEV="${SHARNESS_TEST_DIRECTORY}/openssl-ca/dev"
+CA_REL="${SHARNESS_TEST_DIRECTORY}/openssl-ca/rel"
+if [ -e "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so" ]; then
+  SOFTHSM2_MOD="/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+else
+  SOFTHSM2_MOD="/usr/lib/softhsm/libsofthsm2.so"
+fi
+
 # Provide functions to start and stop a dedicated session bus
 start_session_bus ()
 {
@@ -53,6 +63,48 @@ stop_rauc_dbus_service ()
   wait ${RAUC_DBUS_SERVICE_PID}
 }
 
+prepare_softhsm2 ()
+{
+  export SOFTHSM2_CONF="${SHARNESS_TRASH_DIRECTORY}/softhsm2.conf"
+  export SOFTHSM2_DIR="${SHARNESS_TRASH_DIRECTORY}/softhsm2.tokens"
+
+  echo "directories.tokendir = $SOFTHSM2_DIR" > "$SOFTHSM2_CONF"
+  mkdir -p "$SOFTHSM2_DIR"
+
+  pkcs11-tool --module ${SOFTHSM2_MOD} --init-token --label rauc --so-pin 0000
+  pkcs11-tool --module ${SOFTHSM2_MOD} -l --so-pin 0000 --new-pin 1111 --init-pin
+
+  p11-kit list-modules
+
+  openssl engine pkcs11 -tt -vvvv
+
+  openssl x509 -in ${CA_DEV}/autobuilder-1.cert.pem -inform pem -outform der | \
+    pkcs11-tool --module ${SOFTHSM2_MOD} -l --pin 1111 -y cert -w /proc/self/fd/0 \
+    --label autobuilder-1 --id 01
+  openssl rsa -in ${CA_DEV}/private/autobuilder-1.pem -inform pem -pubout -outform der | \
+    pkcs11-tool --module ${SOFTHSM2_MOD} -l --pin 1111 -y pubkey -w /proc/self/fd/0 \
+    --label autobuilder-1 --id 01
+  openssl rsa -in ${CA_DEV}/private/autobuilder-1.pem -inform pem -outform der | \
+    pkcs11-tool --module ${SOFTHSM2_MOD} -l --pin 1111 -y privkey -w /proc/self/fd/0 \
+    --label autobuilder-1 --id 01
+
+  openssl x509 -in ${CA_DEV}/autobuilder-2.cert.pem -inform pem -outform der | \
+    pkcs11-tool --module ${SOFTHSM2_MOD} -l --pin 1111 -y cert -w /proc/self/fd/0 \
+    --label autobuilder-2 --id 02
+  openssl rsa -in ${CA_DEV}/private/autobuilder-2.pem -inform pem -pubout -outform der | \
+    pkcs11-tool --module ${SOFTHSM2_MOD} -l --pin 1111 -y pubkey -w /proc/self/fd/0 \
+    --label autobuilder-2 --id 02
+  openssl rsa -in ${CA_DEV}/private/autobuilder-2.pem -inform pem -outform der | \
+    pkcs11-tool --module ${SOFTHSM2_MOD} -l --pin 1111 -y privkey -w /proc/self/fd/0 \
+    --label autobuilder-2 --id 02
+
+  pkcs11-tool --module ${SOFTHSM2_MOD} -l --pin 1111 --list-objects
+
+  export RAUC_PKCS11_PIN=1111
+  # setting the module is needed only if p11-kit doesn't work
+  export RAUC_PKCS11_MODULE=${SOFTHSM2_MOD}
+}
+
 # Prerequisite: JSON support enabled [JSON]
 grep -q "ENABLE_JSON 1" $SHARNESS_TEST_DIRECTORY/../config.h && \
   test_set_prereq JSON
@@ -61,6 +113,19 @@ grep -q "ENABLE_JSON 1" $SHARNESS_TEST_DIRECTORY/../config.h && \
 grep -q "ENABLE_SERVICE 1" $SHARNESS_TEST_DIRECTORY/../config.h &&
   test_set_prereq SERVICE &&
   select_system_or_session_bus
+
+# Prerequisite: casync available [CASYNC]
+casync --version &&
+  test_set_prereq CASYNC
+
+# Prerequisite: softhsm2 installed [PKCS11]
+test -f ${SOFTHSM2_MOD} &&
+  prepare_softhsm2 &&
+  test_set_prereq PKCS11
+
+# Prerequisite: faketime available [FAKETIME]
+faketime "2018-01-01" date &&
+  test_set_prereq FAKETIME
 
 test_expect_success "rauc noargs" "
   test_must_fail rauc
@@ -123,6 +188,15 @@ test_expect_success "rauc info" "
     info $SHARNESS_TEST_DIRECTORY/good-bundle.raucb
 "
 
+test_expect_success "rauc info valid file URI" "
+  rauc info -c $SHARNESS_TEST_DIRECTORY/test.conf file://$SHARNESS_TEST_DIRECTORY/good-bundle.raucb
+"
+
+test_expect_success "rauc info invalid file URI" "
+  test_must_fail rauc info -c $SHARNESS_TEST_DIRECTORY/test.conf file:/$SHARNESS_TEST_DIRECTORY/good-bundle.raucb &&
+  test_must_fail rauc info -c $SHARNESS_TEST_DIRECTORY/test.conf file://$SHARNESS_TEST_DIRECTORY/good-bundle.rauc
+"
+
 test_expect_success "rauc info shell" "
   rauc -c $SHARNESS_TEST_DIRECTORY/test.conf --output-format=shell \
     info $SHARNESS_TEST_DIRECTORY/good-bundle.raucb | sh
@@ -144,11 +218,48 @@ test_expect_success "rauc info invalid" "
 "
 
 test_expect_success "rauc bundle" "
+  rm -f out.raucb &&
   rauc \
     --cert $SHARNESS_TEST_DIRECTORY/openssl-ca/dev/autobuilder-1.cert.pem \
     --key $SHARNESS_TEST_DIRECTORY/openssl-ca/dev/private/autobuilder-1.pem \
     bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
+  rauc -c $SHARNESS_TEST_DIRECTORY/test.conf info out.raucb &&
+  test -f out.raucb &&
+  rm out.raucb
+"
+
+test_expect_success PKCS11 "rauc bundle with PKCS11 (key 1)" "
+  rm -f out.raucb &&
+  rauc \
+    --cert 'pkcs11:token=rauc;object=autobuilder-1' \
+    --key 'pkcs11:token=rauc;object=autobuilder-1' \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
   rauc -c $SHARNESS_TEST_DIRECTORY/test.conf info out.raucb
+"
+
+test_expect_success PKCS11 "rauc bundle with PKCS11 (key 2)" "
+  rm -f out.raucb &&
+  rauc \
+    --cert 'pkcs11:token=rauc;object=autobuilder-2' \
+    --key 'pkcs11:token=rauc;object=autobuilder-2' \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
+  rauc -c $SHARNESS_TEST_DIRECTORY/test.conf info out.raucb
+"
+
+test_expect_success PKCS11 "rauc bundle with PKCS11 (key mismatch)" "
+  rm -f out.raucb &&
+  test_must_fail rauc \
+    --cert 'pkcs11:token=rauc;object=autobuilder-1' \
+    --key 'pkcs11:token=rauc;object=autobuilder-2' \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb
+"
+
+test_expect_success SERVICE "rauc service double-init failure" "
+  start_rauc_dbus_service \
+    --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
+    --override-boot-slot=system0 &&
+  test_when_finished stop_rauc_dbus_service &&
+  test_must_fail rauc service
 "
 
 test_expect_success !SERVICE "rauc --override-boot-slot=system0 status: internally" "
@@ -181,55 +292,40 @@ test_expect_success SERVICE "rauc --override-boot-slot=system0 status: via D-Bus
     --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
     --override-boot-slot=system0 &&
   test_when_finished stop_rauc_dbus_service &&
-  rauc \
-    --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
-    --override-boot-slot=system0 \
-    status
+  rauc status
 "
 
-test_expect_success SERVICE "rauc status readable: via D-Bus" "
+test_expect_success SERVICE "rauc status (detailed) readable: via D-Bus" "
   start_rauc_dbus_service \
     --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
     --override-boot-slot=system0 &&
   test_when_finished stop_rauc_dbus_service &&
-  rauc \
-    --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
-    --override-boot-slot=system0 \
-    status --output-format=readable
+  rauc status --detailed --output-format=readable
 "
 
-test_expect_success SERVICE "rauc status shell: via D-Bus" "
+test_expect_success SERVICE "rauc status (detailed) shell: via D-Bus" "
   start_rauc_dbus_service \
     --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
     --override-boot-slot=system0 &&
   test_when_finished stop_rauc_dbus_service &&
-  rauc \
-    --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
-    --override-boot-slot=system0 \
-    status --output-format=shell \
+  rauc status --detailed --output-format=shell \
   | sh
 "
 
-test_expect_success SERVICE,JSON "rauc status json: via D-Bus" "
+test_expect_success SERVICE,JSON "rauc status (detailed) json: via D-Bus" "
   start_rauc_dbus_service \
     --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
     --override-boot-slot=system0 &&
   test_when_finished stop_rauc_dbus_service &&
-  rauc \
-    --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
-    --override-boot-slot=system0 \
-    status --output-format=json
+  rauc status --detailed --output-format=json
 "
 
-test_expect_success SERVICE,JSON "rauc status json-pretty: via D-Bus" "
+test_expect_success SERVICE,JSON "rauc status (detailed) json-pretty: via D-Bus" "
   start_rauc_dbus_service \
     --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
     --override-boot-slot=system0 &&
   test_when_finished stop_rauc_dbus_service &&
-  rauc \
-    --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
-    --override-boot-slot=system0 \
-    status --output-format=json-pretty
+  rauc status --detailed --output-format=json-pretty
 "
 
 test_expect_success SERVICE "rauc status invalid: via D-Bus" "
@@ -237,10 +333,7 @@ test_expect_success SERVICE "rauc status invalid: via D-Bus" "
     --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
     --override-boot-slot=system0 &&
   test_when_finished stop_rauc_dbus_service &&
-  test_must_fail rauc \
-    --conf=${SHARNESS_TEST_DIRECTORY}/test.conf \
-    --override-boot-slot=system0 \
-    status --output-format=invalid
+  test_must_fail rauc status --output-format=invalid
 "
 
 test_expect_success !SERVICE "rauc status mark-good: internally" "
@@ -304,6 +397,93 @@ test_expect_success "rauc write-slot invalid slot" "
   test_must_fail rauc -c $SHARNESS_TEST_DIRECTORY/test.conf write-slot system0 foo &&
   test_must_fail rauc -c $SHARNESS_TEST_DIRECTORY/test.conf write-slot system0 foo.img &&
   test_must_fail rauc -c $SHARNESS_TEST_DIRECTORY/test.conf write-slot system0 /path/to/foo.img
+"
+
+test_expect_success "rauc write-slot readonly" "
+  test_must_fail rauc -c $SHARNESS_TEST_DIRECTORY/test.conf write-slot rescue.0 $SHARNESS_TEST_DIRECTORY/install-content/appfs.img
+"
+
+echo "\
+[system]
+compatible=Test Config
+bootloader=grub
+grubenv=grubenv.test
+
+[keyring]
+path=openssl-ca/dev-ca.pem
+use-bundle-signing-time=true
+" > $SHARNESS_TEST_DIRECTORY/use-bundle-signing-time.conf
+cleanup rm $SHARNESS_TEST_DIRECTORY/use-bundle-signing-time.conf
+
+test_expect_success FAKETIME "rauc verify with 'use-bundle-signing-time': valid signing time, invalid current time" "
+  faketime "2018-01-01" \
+  rauc \
+    --cert $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/release-2018.cert.pem \
+    --key $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/private/release-2018.pem \
+    --keyring $SHARNESS_TEST_DIRECTORY/openssl-ca/rel-ca.pem \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
+  faketime "2022-01-01" rauc --conf $SHARNESS_TEST_DIRECTORY/use-bundle-signing-time.conf info out.raucb &&
+  rm out.raucb
+"
+
+test_expect_success FAKETIME "rauc verfiy with 'use-bundle-signing-time': invalid signing time, valid current time" "
+  faketime "2022-01-01" \
+  rauc \
+    --cert $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/release-2018.cert.pem \
+    --key $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/private/release-2018.pem \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
+  test_must_fail faketime "2018-01-01" rauc --conf $SHARNESS_TEST_DIRECTORY/use-bundle-signing-time.conf info out.raucb &&
+  rm out.raucb
+"
+
+test_expect_success FAKETIME "rauc sign bundle with expired certificate" "
+  test_must_fail faketime "2019-07-02" \
+  rauc \
+    --cert $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/release-2018.cert.pem \
+    --key $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/private/release-2018.pem \
+    --keyring $SHARNESS_TEST_DIRECTORY/openssl-ca/rel-ca.pem \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
+    test ! -f out.raucb
+"
+
+test_expect_success FAKETIME "rauc sign bundle with not yet valid certificate" "
+  test_must_fail faketime "2017-01-01" \
+  rauc \
+    --cert $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/release-2018.cert.pem \
+    --key $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/private/release-2018.pem \
+    --keyring $SHARNESS_TEST_DIRECTORY/openssl-ca/rel-ca.pem \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
+    test ! -f out.raucb
+"
+
+test_expect_success FAKETIME "rauc sign bundle with almost expired certificate" "
+  faketime "2019-06-15" \
+  rauc \
+    --cert $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/release-2018.cert.pem \
+    --key $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/private/release-2018.pem \
+    --keyring $SHARNESS_TEST_DIRECTORY/openssl-ca/rel-ca.pem \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
+    test -f out.raucb &&
+    rm out.raucb
+"
+
+test_expect_success FAKETIME "rauc sign bundle with valid certificate" "
+  faketime "2019-01-01" \
+  rauc \
+    --cert $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/release-2018.cert.pem \
+    --key $SHARNESS_TEST_DIRECTORY/openssl-ca/rel/private/release-2018.pem \
+    --keyring $SHARNESS_TEST_DIRECTORY/openssl-ca/rel-ca.pem \
+    bundle $SHARNESS_TEST_DIRECTORY/install-content out.raucb &&
+    test -f out.raucb &&
+    rm out.raucb
+"
+
+test_expect_success CASYNC "rauc convert" "
+  rauc \
+    --cert $SHARNESS_TEST_DIRECTORY/openssl-ca/dev/autobuilder-1.cert.pem \
+    --key $SHARNESS_TEST_DIRECTORY/openssl-ca/dev/private/autobuilder-1.pem \
+    --keyring $SHARNESS_TEST_DIRECTORY/openssl-ca/dev-ca.pem \
+    convert $SHARNESS_TEST_DIRECTORY/good-bundle.raucb casync.raucb
 "
 
 test_done
