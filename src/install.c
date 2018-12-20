@@ -649,6 +649,8 @@ static gboolean launch_and_wait_handler(gchar *update_source, gchar *handler_nam
 			continue;
 
 		parse_handler_output(outline);
+
+		g_free(outline);
 	} while (outline);
 
 	res = g_subprocess_wait_check(handleproc, NULL, &ierror);
@@ -1230,6 +1232,7 @@ out:
 }
 #endif
 
+#if ENABLE_NETWORK
 static void print_slot_hash_table(GHashTable *hash_table)
 {
 	GHashTableIter iter;
@@ -1241,6 +1244,7 @@ static void print_slot_hash_table(GHashTable *hash_table)
 		g_print("  %s -> %s\n", key, slot->name);
 	}
 }
+#endif
 
 gboolean do_install_bundle(RaucInstallArgs *args, GError **error)
 {
